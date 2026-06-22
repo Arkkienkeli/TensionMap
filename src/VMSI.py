@@ -349,6 +349,12 @@ class VMSI():
 
                     # update current edges
                     # this requires edges to be in the same order as vertices
+                    print(nedges, neg_verts, pos_verts, nverts, ncells, self.vertices.at[v,'coords'])
+                    #if len(nedges) > len(neg_verts):
+                    #    nedges = nedges[:-1]
+                    #if len(nedges) > len(pos_verts):
+                    #    nedges = nedges[:-1]                        
+                    
                     neg_edges = nedges[neg_verts.astype('bool')]
                     pos_edges = nedges[pos_verts.astype('bool')]
 
@@ -488,8 +494,10 @@ class VMSI():
         for cell in self.bulk_cells:
             if np.sum(np.isin(self.cells.at[cell, 'ncells'], self.bulk_cells)) == 0:
                 bad_cells = np.append(bad_cells, cell)
+        
+        #print(len(bad_cells), len(self.bulk_cells), len(self.cells), len(boundary_cells))
         self.bulk_cells = self.bulk_cells[np.isin(self.bulk_cells, bad_cells, invert=True)]
-
+        print(len(self.bulk_cells))
         # This excludes vertices surrounded by boundary cells; edges at these vertices are not constrained enough for accurate inference
         self.bulk_vertices = np.unique(np.concatenate([self.cells.at[cell, 'nverts'] for cell in self.bulk_cells]))
 
@@ -849,7 +857,7 @@ class VMSI():
                 return float(E)
 
             # Configure optimiser
-            local_opt = nlopt.opt(nlopt.LD_LBFGS, x0.size)
+            local_opt = nlopt.opt(nlopt.LN_NELDERMEAD, x0.size)
             init_opt = nlopt.opt(nlopt.AUGLAG, x0.size)
             init_opt.set_local_optimizer(local_opt)
             init_opt.set_min_objective(energy)
@@ -943,10 +951,10 @@ class VMSI():
                 theta0 = np.zeros_like(theta0)
 
             # Configure optimiser
-            theta_local_opt = nlopt.opt(nlopt.LD_LBFGS, theta0.size)
+            theta_local_opt = nlopt.opt(nlopt.LN_NELDERMEAD, theta0.size)
             theta_opt = nlopt.opt(nlopt.AUGLAG, theta0.size)
             theta_opt.set_local_optimizer(theta_local_opt)
-            theta_opt.set_ftol_abs(1e-5)
+            theta_opt.set_ftol_abs(1e-4)
             theta_opt.set_min_objective(theta_energy)
             theta_opt.add_inequality_mconstraint(theta_neqlincon, 1e-5*np.ones(self.dC.shape[0]))
             # Having trouble with NLopt generic failures so disable equality constraint for now
@@ -1106,7 +1114,7 @@ class VMSI():
                 result[:] = E
                 return
 
-            local_opt = nlopt.opt(nlopt.LD_LBFGS, X0.size)
+            local_opt = nlopt.opt(nlopt.LN_NELDERMEAD, X0.size)
 
             main_opt = nlopt.opt(nlopt.AUGLAG, X0.size)
             main_opt.set_local_optimizer(local_opt)

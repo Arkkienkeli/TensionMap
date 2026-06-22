@@ -48,6 +48,7 @@ class Segmenter:
 
         # Clear border (create external cell from all cells that run into image boundary)
         tmp1 = seg.clear_border(self.masks)
+        #print('tmp1 beginning', np.unique(tmp1))
         # If we are specifying holes, also set cells bordering holes as external cell
         if holes_mask is not None:
             tmp5 = morph.binary_dilation(holes_mask, footprint=np.ones([5,5]))
@@ -56,13 +57,15 @@ class Segmenter:
             tmp1[tmp6] = 0
         tmp2 = ((self.masks - tmp1)>0).astype(int)
         tmp3 = tmp1 + tmp2
+        #print('tmp1 after holes', np.unique(tmp1))
 
         # Find edge pixels that only separate external cells
         kernel = lambda neighborhood : len(set(neighborhood))
         tmp4 = generic_filter(tmp3, kernel, footprint=np.ones([3,3]))
         tmp1[np.logical_and(tmp1==0,tmp4<3)] = 1
-
+        #print('tmp1 after logical and', np.unique(tmp1))
         mask_tmp = tmp1
+        #print('mask_tmp', np.unique(mask_tmp))
 
         # Relabel mask (may not be necessary in future, just for Matlab compatibility)
         mask_tmp = self.relabel(mask_tmp)
@@ -79,7 +82,7 @@ class Segmenter:
 
         obj.V_df, cc = self.find_vertices(mask_tmp, obj.C_df)
         obj.E_df = self.find_edges(obj, mask_tmp, cc)
-        self.identify_holes(obj)
+        self.identify_holes(obj,holes_mask)
         return obj, mask_tmp
 
     def find_vertices(self, mask, C_df):
@@ -168,7 +171,8 @@ class Segmenter:
         moments_hu = np.array([regionprops.moments_hu for regionprops in measure.regionprops(mask)])
         cell_props = pd.DataFrame(measure.regionprops_table(mask, properties=('label', 'feret_diameter_max','area')))
 
-
+        print(mask.shape, np.unique(mask))
+        print(len(measure.regionprops(mask)), p.shape, c.shape)
         # estimate very_far to be the half the maximum cell perimeter
         self.very_far = np.max(p[1:])/2
 
@@ -181,16 +185,20 @@ class Segmenter:
             C_df = pd.concat([C_df, cell_df], ignore_index=True)
         return C_df
 
-    def identify_holes(self, obj):
+    def identify_holes(self, obj, holes_mask):
         """
         Filter out labelled objects that have area greater than 2x the median area and are non-convex
         """
         areas = obj.C_df['area'].to_numpy()
         for i in range(obj.C_df.shape[0]):
             vcoords = np.array(obj.V_df.loc[obj.C_df.at[i, 'nverts'], 'coords'].tolist())
-            if vcoords.shape[0] >= 3:
+            centroid = np.array(obj.C_df.at[i, 'centroids']).astype(int)
+            vcoords_unique_xs = len(set([p[0] for p in vcoords]))
+            vcoords_unique_ys = len(set([p[1] for p in vcoords]))
+
+            if vcoords.shape[0] >= 3 and holes_mask[centroid[1], centroid[0]] == 0:
                 hull = ConvexHull(vcoords)
-                if hull.simplices.shape[0] < vcoords.shape[0] and obj.C_df.at[i, 'area'] > 2*np.median(areas):
+                if hull.simplices.shape[0] < vcoords.shape[0] and obj.C_df.at[i, 'area'] > 3*np.median(areas):
                     obj.C_df.at[i, 'holes'] = True
             else:
                 obj.C_df.at[i, 'holes'] = True
