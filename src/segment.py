@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import skimage.morphology
+import scipy.ndimage as ndi
 from scipy.ndimage import generic_filter
 from scipy.optimize import minimize, leastsq
 from scipy.spatial import ConvexHull
@@ -103,7 +104,11 @@ class Segmenter:
 
             vertex = v[i,:]
             # Flip again to convert back to numpy indexing
-            ncells = mask[min(a[i][:,0])-1:max(a[i][:,0])+2, min(a[i][:,1])-1:max(a[i][:,1])+2]
+            r0 = max(0, min(a[i][:,0])-1)
+            r1 = min(mask.shape[0], max(a[i][:,0])+2)
+            c0 = max(0, min(a[i][:,1])-1)
+            c1 = min(mask.shape[1], max(a[i][:,1])+2)
+            ncells = mask[r0:r1, c0:c1]
             ncells = np.unique(ncells[ncells!=0])-1
 
             vertex_df = pd.DataFrame({'coords':[vertex],'ncells':[ncells],'nverts':[np.array([])],'edges':[np.array([])]})
@@ -196,7 +201,7 @@ class Segmenter:
             vcoords_unique_xs = len(set([p[0] for p in vcoords]))
             vcoords_unique_ys = len(set([p[1] for p in vcoords]))
 
-            if vcoords.shape[0] >= 3 and holes_mask[centroid[1], centroid[0]] == 0:
+            if vcoords.shape[0] >= 3 and (holes_mask is None or holes_mask[centroid[1], centroid[0]] == 0):
                 hull = ConvexHull(vcoords)
                 if hull.simplices.shape[0] < vcoords.shape[0] and obj.C_df.at[i, 'area'] > 3*np.median(areas):
                     obj.C_df.at[i, 'holes'] = True
@@ -254,9 +259,9 @@ class Segmenter:
                     sort1 = np.sort(D[end_points[0],:]).squeeze()
                     sort2 = np.sort(D[end_points[1],:]).squeeze()
                     if abs(sort1[0] - sort1[1]) <= np.sqrt(3):
-                        v1 = np.argsort(D[end_points[0],:]).squeeze()[0]
+                        v1 = np.argsort(D[end_points[0],:]).squeeze()[1]
                     elif abs(sort2[0] - sort2[1]) <= np.sqrt(3):
-                        v2 = np.argsort(D[end_points[1],:]).squeeze()[0]
+                        v2 = np.argsort(D[end_points[1],:]).squeeze()[1]
 
             if (v1 != -1) and (v2 != -1) and (v2 in obj.V_df.at[v1, 'nverts']) and ((v1 not in obj.C_df.at[0, 'nverts']) or (v2 not in obj.C_df.at[0, 'nverts'])):
                 pix = np.ravel_multi_index(np.flip(b_props[i-1].coords.T), mask.shape[::-1])
@@ -272,9 +277,9 @@ class Segmenter:
                 edge_2 = np.argwhere((np.vstack(E_df['verts'])[:,1] == v)*(np.vstack(E_df['verts'])[:,0] == nv))
 
                 if edge_1.size > 0:
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_1)
+                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_1.ravel()[0])
                 elif edge_2.size > 0:
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_2)
+                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_2.ravel()[0])
                 elif (v not in obj.C_df.at[0, 'nverts']) and (nv not in obj.C_df.at[0, 'nverts']):
                     # Create new edge
                     line = draw.line(obj.V_df.at[v, 'coords'][1], obj.V_df.at[v, 'coords'][0], obj.V_df.at[nv, 'coords'][1], obj.V_df.at[nv, 'coords'][0])
@@ -283,7 +288,7 @@ class Segmenter:
                     cells = np.intersect1d(obj.V_df.at[v, 'ncells'], obj.V_df.at[nv, 'ncells'])
                     edge_df = pd.DataFrame({'pixels':[pix],'verts':[verts],'cells':[cells]})
                     E_df = pd.concat([E_df, edge_df], ignore_index=True)
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], len(E_df))
+                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], len(E_df) - 1)
                 else:
                     obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], np.array([-1]))
 
@@ -312,10 +317,10 @@ class Segmenter:
     def endpoints(self, image):
         # Define endpoint as pixel with only 1 4-connected neighbor
         # This requires the skeletonized image to be 4-connnected
-        image = image.astype(np.int)
+        image = image.astype(int)
         k = np.array([[0,1,0],[1,0,1],[0,1,0]])
         neighborhood_count = ndi.convolve(image,k, mode='constant', cval=1)
-        neighborhood_count[~image.astype(np.bool)] = 0
+        neighborhood_count[~image.astype(bool)] = 0
         return neighborhood_count == 1
 
     def segment_image(self, diameter=None, channels=[0,0], use_model='default'):

@@ -349,12 +349,11 @@ class VMSI():
 
                     # update current edges
                     # this requires edges to be in the same order as vertices
-                    print(nedges, neg_verts, pos_verts, nverts, ncells, self.vertices.at[v,'coords'])
-                    #if len(nedges) > len(neg_verts):
-                    #    nedges = nedges[:-1]
-                    #if len(nedges) > len(pos_verts):
-                    #    nedges = nedges[:-1]                        
-                    
+                    if len(nedges) != len(nverts):
+                        # Keep only edges that connect v to one of its listed neighbours
+                        nedges = np.array([e for e in nedges
+                                           if any(nv in self.edges.at[int(e), 'verts'] for nv in nverts)])
+
                     neg_edges = nedges[neg_verts.astype('bool')]
                     pos_edges = nedges[pos_verts.astype('bool')]
 
@@ -484,7 +483,7 @@ class VMSI():
 
         self.bulk_cells = np.array(range(0,len(self.cells)))
 
-        boundary_cells = np.unique(np.concatenate([self.cells.at[0, 'ncells'], np.where(self.cells['holes'].to_numpy()[1:])[0]]))
+        boundary_cells = np.unique(np.concatenate([self.cells.at[0, 'ncells'], np.where(self.cells['holes'].to_numpy())[0]]))
 
         # Remove boundary cells and cells surrounded by boundary cells from bulk cells
 #        all_threefold = np.array([not(any(self.vertices.loc[self.cells.at[cell, 'nverts'], 'fourfold'].to_numpy())) for cell in range(len(self.cells))])
@@ -497,7 +496,12 @@ class VMSI():
         
         #print(len(bad_cells), len(self.bulk_cells), len(self.cells), len(boundary_cells))
         self.bulk_cells = self.bulk_cells[np.isin(self.bulk_cells, bad_cells, invert=True)]
-        print(len(self.bulk_cells))
+        if len(self.bulk_cells) == 0:
+            raise ValueError(
+                "No bulk (interior) cells found after removing boundary and hole cells. "
+                "The region may be too small, or the holes_mask may be marking too many cells as holes. "
+                f"Total cells: {len(self.cells)-1}, boundary cells: {len(boundary_cells)}."
+            )
         # This excludes vertices surrounded by boundary cells; edges at these vertices are not constrained enough for accurate inference
         self.bulk_vertices = np.unique(np.concatenate([self.cells.at[cell, 'nverts'] for cell in self.bulk_cells]))
 
@@ -524,14 +528,14 @@ class VMSI():
         # Build cell adjacency matrix
         adj_mat = np.zeros((len(self.involved_cells), len(self.involved_cells)))
         num_edges = 0
-        edge_cells = self.edges.cells.to_list()
+        edge_cell_pairs = {frozenset(c) for c in self.edges.cells.to_list() if len(c) == 2}
 
         for i in range(len(self.involved_cells)):
             cell = self.involved_cells[i]
             for ncell in self.cells.at[cell, 'ncells']:
                 j = np.ravel(np.where(self.involved_cells == ncell))
                 # Ensure that edge between neighbouring cells actually exists
-                if j.size > 0 and adj_mat[i, j] == 0 and np.any(np.all(np.sort(np.array([cell, ncell])) == edge_cells, axis=1)):
+                if j.size > 0 and adj_mat[i, j] == 0 and frozenset([cell, ncell]) in edge_cell_pairs:
                     adj_mat[i, j] = 1
                     adj_mat[j, i] = 1
                     num_edges += 1
@@ -584,6 +588,8 @@ class VMSI():
 
         for i in range(len(self.edges)):
             edge_cells = self.edges.at[i, 'cells']
+            if len(edge_cells) != 2:
+                continue
             idx = np.where((self.dC[:,np.where(edge_cells[0]==self.involved_cells)[0]] != 0) & (self.dC[:,np.where(edge_cells[1]==self.involved_cells)[0]] != 0))[0]
             self.involved_edges[idx] = i
 
@@ -675,11 +681,14 @@ class VMSI():
         """
 
         # Each arc has a number of pixels equal to the average edge length
-        self.avg_edge_length = int(np.median([self.edges.at[edge, 'pixels'].shape[0] for edge in self.involved_edges]))
+        valid_edges = self.involved_edges[self.involved_edges >= 0]
+        self.avg_edge_length = int(np.median([self.edges.at[edge, 'pixels'].shape[0] for edge in valid_edges]))
         self.edgearc_x = np.zeros((len(self.involved_edges), self.avg_edge_length))
         self.edgearc_y = np.zeros((len(self.involved_edges), self.avg_edge_length))
 
         for i in range(len(self.involved_edges)):
+            if self.involved_edges[i] < 0:
+                continue
             r = np.array([self.vertices.at[self.edges.at[self.involved_edges[i], 'verts'][0], 'coords'],
                           self.vertices.at[self.edges.at[self.involved_edges[i], 'verts'][1], 'coords']])
             # Construct circular arc for curved edges
@@ -775,9 +784,11 @@ class VMSI():
             import nlopt
             scale = 0.5 * (np.mean(np.linalg.norm(t1_0, axis=1)) + np.mean(np.linalg.norm(t2_0, axis=1)))
 
+            _init_best_x = [np.clip(x0.ravel(order='F'), -1e9, 1e9).copy()]
+            _init_best_E = [np.inf]
+
             # Define energy function for initial minimisation
             def energy(x, grad=np.array([])):
-                np.savetxt('./.init_opt.csv', x, delimiter=',',fmt='%f')
                 x = x.reshape(x0.shape, order='F')
                 q = x[:,0:2]
                 p = x[:,2]
@@ -785,8 +796,12 @@ class VMSI():
                 b = np.matmul(self.dC, np.multiply(q.T,p).T)
                 delta_p = np.matmul(self.dC, p)
 
-                t1 = np.divide((b - (np.multiply(r1.T,delta_p).T)).T,np.linalg.norm(b - (np.multiply(r1.T,delta_p).T), axis=1)).T
-                t2 = np.divide((b - (np.multiply(r2.T,delta_p).T)).T,np.linalg.norm(b - (np.multiply(r2.T,delta_p).T), axis=1)).T
+                v1 = b - np.multiply(r1.T, delta_p).T
+                v2 = b - np.multiply(r2.T, delta_p).T
+                n1 = np.maximum(np.linalg.norm(v1, axis=1), 1e-10)
+                n2 = np.maximum(np.linalg.norm(v2, axis=1), 1e-10)
+                t1 = np.divide(v1.T, n1).T
+                t2 = np.divide(v2.T, n2).T
 
                 E = 0.5 * np.mean(np.power(np.sum(t1 * tau_1, axis=1), 2) +
                                   np.power(np.sum(t2 * tau_2, axis=1), 2))
@@ -810,6 +825,9 @@ class VMSI():
                     dE = np.bincount(rows, weights=np.ravel(dE,order='F'))
                     grad[:] = dE
 
+                if np.isfinite(E) and E < _init_best_E[0]:
+                    _init_best_E[0] = E
+                    _init_best_x[0] = x.ravel(order='F').copy()
                 if self.verbose:
                     print(E)
                 return E
@@ -823,14 +841,18 @@ class VMSI():
                 b = np.matmul(self.dC, np.multiply(q.T,p).T)
                 delta_p = np.matmul(self.dC, p)
 
-                l1 = np.linalg.norm(b - (np.multiply(r1.T,delta_p).T), axis=1)
-                l2 = np.linalg.norm(b - (np.multiply(r2.T,delta_p).T), axis=1)
+                v1 = b - np.multiply(r1.T, delta_p).T
+                v2 = b - np.multiply(r2.T, delta_p).T
+                l1 = np.linalg.norm(v1, axis=1)
+                l2 = np.linalg.norm(v2, axis=1)
 
                 E = 0.5*(np.mean(l1) + np.mean(l2)) - scale
 
                 if grad.size > 0:
-                    t1 = np.divide((b - (np.multiply(r1.T,delta_p).T)).T,np.linalg.norm(b - (np.multiply(r1.T,delta_p).T), axis=1)).T
-                    t2 = np.divide((b - (np.multiply(r2.T,delta_p).T)).T,np.linalg.norm(b - (np.multiply(r2.T,delta_p).T), axis=1)).T
+                    n1 = np.maximum(l1, 1e-10)
+                    n2 = np.maximum(l2, 1e-10)
+                    t1 = np.divide(v1.T, n1).T
+                    t2 = np.divide(v2.T, n2).T
 
                     drX1 = rx_grad(p[self.cell_pairs[:,0]], p[self.cell_pairs[:,1]], q[self.cell_pairs[:,0],0], q[self.cell_pairs[:,1],0], r1[:,0])
                     drX2 = rx_grad(p[self.cell_pairs[:,0]], p[self.cell_pairs[:,1]], q[self.cell_pairs[:,0],0], q[self.cell_pairs[:,1],0], r2[:,0])
@@ -857,26 +879,23 @@ class VMSI():
                 return float(E)
 
             # Configure optimiser
-            local_opt = nlopt.opt(nlopt.LN_NELDERMEAD, x0.size)
+            local_opt = nlopt.opt(nlopt.LD_LBFGS, x0.size)
             init_opt = nlopt.opt(nlopt.AUGLAG, x0.size)
             init_opt.set_local_optimizer(local_opt)
             init_opt.set_min_objective(energy)
-            lb = np.concatenate((-np.inf*np.ones(x0.shape[0]), -np.inf*np.ones(x0.shape[0]), 0.001*np.ones(x0.shape[0])))
-            ub = np.concatenate((np.inf*np.ones(x0.shape[0]), np.inf*np.ones(x0.shape[0]), 2000*np.ones(x0.shape[0])))
+            lb = np.concatenate((-1e9*np.ones(x0.shape[0]), -1e9*np.ones(x0.shape[0]), 0.001*np.ones(x0.shape[0])))
+            ub = np.concatenate((1e9*np.ones(x0.shape[0]), 1e9*np.ones(x0.shape[0]), 2000*np.ones(x0.shape[0])))
             init_opt.set_lower_bounds(lb)
             init_opt.set_upper_bounds(ub)
             init_opt.add_inequality_constraint(nonlinear_con, 1e-6)
             init_opt.add_equality_constraint(linear_con, 1e-6)
             init_opt.set_maxeval(2000)
 
-            # Optimisation
-            # Nlopt can't handle initial values outside bounds so clip values before optimisation
-            init_opt.optimize(np.clip(x0.ravel(order='F'), lb, ub))
-
-            # For larger systems, the nlopt optimiser will not converge to the desired tolerance and does not return the results obtained at the final step
-            # To get around this, retrieve results from log file
-            x = np.genfromtxt('.init_opt.csv', delimiter=',')
-            x = x.reshape(x0.shape, order='F')
+            try:
+                x_opt = init_opt.optimize(np.clip(x0.ravel(order='F'), lb, ub))
+            except (nlopt.RoundoffLimited, nlopt.ForcedStop, RuntimeError):
+                x_opt = _init_best_x[0]
+            x = x_opt.reshape(x0.shape, order='F')
 
             q = x[:,0:2]
             p = x[:,2]
@@ -886,17 +905,19 @@ class VMSI():
             # Once q, p are optimised, perform initial optimisation for theta
             theta0 = self.estimate_theta(x)
 
+            _theta_best_x = [theta0.copy()]
+            _theta_best_E = [np.inf]
+
             # Define energy function for theta optimisation
             def theta_energy(theta, grad=np.array([])):
-                np.savetxt('./.theta_opt.csv', theta, delimiter=',',fmt='%f')
-
                 dP = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
+                dP_safe = np.where(np.abs(dP) < 1e-9, np.sign(dP + 1e-15) * 1e-9, dP)
                 dT = theta[self.cell_pairs[:,0]] - theta[self.cell_pairs[:,1]]
                 dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
                 QL = np.sum(np.power(dQ, 2), axis=1)
 
-                rho = np.divide(np.matmul(self.dC,np.multiply(p, q.T).T).T, dP).T
-                r_sq = np.divide(((p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL) - (dP * dT)),np.power(dP, 2))
+                rho = np.divide(np.matmul(self.dC,np.multiply(p, q.T).T).T, dP_safe).T
+                r_sq = np.divide(((p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL) - (dP * dT)), np.power(dP_safe, 2))
                 ind_z = r_sq<0
                 r_sq[r_sq<0] = 0
 
@@ -920,6 +941,9 @@ class VMSI():
                     rows = np.concatenate([self.cell_pairs[:,0], self.cell_pairs[:,1]])
 
                     grad[:] = np.bincount(rows, weights=np.ravel(dE,order='F'))
+                if np.isfinite(E) and E < _theta_best_E[0]:
+                    _theta_best_E[0] = E
+                    _theta_best_x[0] = theta.copy()
                 if self.verbose:
                     print(E)
                 return float(E)
@@ -947,25 +971,24 @@ class VMSI():
                     grad[:] = np.multiply(self.dC.T, dP).T
                 return
 
-            if (theta_energy(np.zeros_like(theta0)) < theta_energy(theta0)):
+            if theta_energy(np.zeros_like(theta0)) < _theta_best_E[0]:
                 theta0 = np.zeros_like(theta0)
+                _theta_best_x[0] = theta0.copy()
 
             # Configure optimiser
-            theta_local_opt = nlopt.opt(nlopt.LN_NELDERMEAD, theta0.size)
+            theta_local_opt = nlopt.opt(nlopt.LD_LBFGS, theta0.size)
             theta_opt = nlopt.opt(nlopt.AUGLAG, theta0.size)
             theta_opt.set_local_optimizer(theta_local_opt)
-            theta_opt.set_ftol_abs(1e-4)
+            theta_opt.set_ftol_rel(1e-6)
             theta_opt.set_min_objective(theta_energy)
             theta_opt.add_inequality_mconstraint(theta_neqlincon, 1e-5*np.ones(self.dC.shape[0]))
-            # Having trouble with NLopt generic failures so disable equality constraint for now
-            # This shouldn't matter since it's only setting the scale which we change during tiling anyway
-    #        theta_opt.add_equality_constraint(theta_eqlincon, 1e-5)
+            theta_opt.add_equality_constraint(theta_eqlincon, 1e-5)
             theta_opt.set_maxeval(2000)
 
-            # Optimise
-            theta_opt.optimize(theta0)
-
-            theta = np.genfromtxt('.theta_opt.csv', delimiter=',')
+            try:
+                theta = theta_opt.optimize(theta0)
+            except (nlopt.RoundoffLimited, nlopt.ForcedStop, RuntimeError):
+                theta = _theta_best_x[0]
             theta = np.array(theta)
 
         elif self.optimiser == 'matlab':
@@ -1024,8 +1047,10 @@ class VMSI():
 
         if self.optimiser == 'nlopt':
             import nlopt
+            _main_best_x = [np.clip(X0.ravel(order='F'), -1e9, 1e9).copy()]
+            _main_best_E = [np.inf]
+
             def objective(X, grad=np.array([])):
-                np.savetxt('./.main_opt.csv', X, delimiter=',',fmt='%f')
                 X = X.reshape(X0.shape, order='F')
 
                 q = X[:,0:2]
@@ -1033,12 +1058,13 @@ class VMSI():
                 theta = X[:,2]
 
                 dP = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
+                dP_safe = np.where(np.abs(dP) < 1e-9, np.sign(dP + 1e-15) * 1e-9, dP)
                 dT = theta[self.cell_pairs[:,0]] - theta[self.cell_pairs[:,1]]
                 dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
                 QL = np.sum(np.power(dQ, 2), axis=1)
 
-                rho = np.divide(np.matmul(self.dC,np.multiply(p, q.T).T).T, dP).T
-                r_sq = np.divide(((p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL) - (dP * dT)),np.power(dP, 2))
+                rho = np.divide(np.matmul(self.dC,np.multiply(p, q.T).T).T, dP_safe).T
+                r_sq = np.divide(((p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL) - (dP * dT)), np.power(dP_safe, 2))
                 ind_z = r_sq<=0
                 r_sq[ind_z] = 0
 
@@ -1047,9 +1073,13 @@ class VMSI():
                 delta_x = np.subtract(rho[:,0],self.edgearc_x.T).T
                 delta_y = np.subtract(rho[:,1],self.edgearc_y.T).T
 
-                dMag = np.sqrt(np.power(delta_x, 2) + np.power(delta_y, 2))
+                dMag = np.maximum(np.sqrt(np.power(delta_x, 2) + np.power(delta_y, 2)), 1e-10)
 
                 E = 0.5 * np.mean(np.sum(np.power(np.subtract(dMag.T, r).T, 2), axis=1))
+
+                if np.isfinite(E) and E < _main_best_E[0]:
+                    _main_best_E[0] = E
+                    _main_best_x[0] = X.ravel(order='F').copy()
 
                 if grad.size>0:
 
@@ -1059,8 +1089,9 @@ class VMSI():
                     dRhoY = rho_y_grad(p[self.cell_pairs[:,0]],p[self.cell_pairs[:,1]],q[self.cell_pairs[:,0],1],q[self.cell_pairs[:,1],1])
                     dR = radius_grad(p[self.cell_pairs[:,0]],p[self.cell_pairs[:,1]],q[self.cell_pairs[:,0],0],q[self.cell_pairs[:,0],1],q[self.cell_pairs[:,1],0],q[self.cell_pairs[:,1],1],theta[self.cell_pairs[:,0]],theta[self.cell_pairs[:,1]])
 
-                    dNormX = np.sum(np.multiply(delta_x,np.divide(d, dMag)),axis=1)
-                    dNormY = np.sum(np.multiply(delta_y,np.divide(d, dMag)),axis=1)
+                    d_over_dMag = np.divide(d, dMag)
+                    dNormX = np.sum(np.multiply(delta_x, d_over_dMag), axis=1)
+                    dNormY = np.sum(np.multiply(delta_y, d_over_dMag), axis=1)
 
                     avg_d = np.sum(d, axis=1)
                     dR[ind_z] = 0
@@ -1114,23 +1145,24 @@ class VMSI():
                 result[:] = E
                 return
 
-            local_opt = nlopt.opt(nlopt.LN_NELDERMEAD, X0.size)
+            local_opt = nlopt.opt(nlopt.LD_LBFGS, X0.size)
 
             main_opt = nlopt.opt(nlopt.AUGLAG, X0.size)
             main_opt.set_local_optimizer(local_opt)
             main_opt.set_min_objective(objective)
-            lb = np.concatenate((-np.inf*np.ones(3*theta0.shape[0]), 0.001*np.ones(theta0.shape[0])))
-            ub = np.concatenate((np.inf*np.ones(3*theta0.shape[0]), 1000*np.ones(theta0.shape[0])))
+            lb = np.concatenate((-1e9*np.ones(3*theta0.shape[0]), 0.001*np.ones(theta0.shape[0])))
+            ub = np.concatenate((1e9*np.ones(3*theta0.shape[0]), 1000*np.ones(theta0.shape[0])))
             main_opt.set_lower_bounds(lb)
             main_opt.set_upper_bounds(ub)
             main_opt.add_inequality_mconstraint(nonlinear_con, 1e-6*np.ones(self.dC.shape[0]))
             main_opt.add_equality_mconstraint(linear_con, 1e-6*np.ones(2))
             main_opt.set_maxeval(2000)
 
-            main_opt.optimize(np.clip(X0.ravel(order='F'),lb,ub))
-
-            X = np.genfromtxt('.main_opt.csv', delimiter=',')
-            X = X.reshape(X0.shape, order='F')
+            try:
+                X_opt = main_opt.optimize(np.clip(X0.ravel(order='F'), lb, ub))
+            except (nlopt.RoundoffLimited, nlopt.ForcedStop, RuntimeError):
+                X_opt = _main_best_x[0]
+            X = X_opt.reshape(X0.shape, order='F')
         elif self.optimiser == 'matlab':
             import matlab
 
@@ -1168,7 +1200,9 @@ class VMSI():
         T = np.sum(np.power(T, 2), axis=1)
         T = T * np.abs(np.array([p[alpha] * p[beta] for (alpha,beta) in self.cell_pairs]))
         T = T - np.multiply(np.matmul(self.dC, p), np.matmul(self.dC, theta))
-        T = np.sqrt(T)
+        if np.any(T < 0):
+            warnings.warn(f"{np.sum(T < 0)} edge(s) have negative T^2 before sqrt — constraint violations at optimizer exit; clamping to 0.")
+        T = np.sqrt(np.maximum(T, 0.0))
         return T
 
     def upload_mechanics(self, p, T, q, theta):
@@ -1217,7 +1251,7 @@ class VMSI():
             verts = self.involved_vertices[self.dV[e,:] != 0]
 
             if len(verts) == 2:
-                ind = np.where(np.all(verts == np.sort(edge_verts, axis=1), axis=1))[0]
+                ind = np.where(np.all(np.sort(verts) == np.sort(edge_verts, axis=1), axis=1))[0]
             else:
                 ind = np.array([])
 
