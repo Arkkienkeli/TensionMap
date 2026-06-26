@@ -12,7 +12,6 @@ import pandas as pd
 from skimage import measure, color
 from matplotlib import cm, patches, colors
 import matplotlib
-from joblib import Parallel, delayed
 from src.segment import Segmenter
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import warnings
@@ -324,13 +323,9 @@ class VMSI():
         Fit circle to each edge
         If edge is too flat, fit line instead
 
-        Parallelized with joblib (prefer='threads') — scipy.optimize.minimize
-        releases the GIL so threads give true parallelism here.
-
         """
-        n_edges = len(self.edges)
-        results = Parallel(n_jobs=-1, prefer='threads')(
-            delayed(_fit_edge)(
+        for i in range(len(self.edges)):
+            _, radius, rho, fitenergy = _fit_edge(
                 i,
                 [self.vertices['coords'][self.edges['verts'][i][0]],
                  self.vertices['coords'][self.edges['verts'][i][1]]],
@@ -338,9 +333,6 @@ class VMSI():
                 self.width,
                 self.height,
             )
-            for i in range(n_edges)
-        )
-        for i, radius, rho, fitenergy in results:
             self.edges.at[i, 'radius'] = radius
             self.edges.at[i, 'rho'] = rho
             self.edges.at[i, 'fitenergy'] = fitenergy

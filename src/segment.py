@@ -64,10 +64,15 @@ class Segmenter:
         tmp3 = tmp1 + tmp2
         #print('tmp1 after holes', np.unique(tmp1))
 
-        # Find edge pixels that only separate external cells
-        kernel = lambda neighborhood : len(set(neighborhood))
-        tmp4 = generic_filter(tmp3, kernel, footprint=np.ones([3,3]))
-        tmp1[np.logical_and(tmp1==0,tmp4<3)] = 1
+        # Find edge pixels that only separate external cells.
+        # Vectorized replacement for generic_filter(tmp3, len(set(neighborhood))):
+        # A background pixel has < 3 unique values in its 3x3 window iff all non-zero
+        # neighbors share the same label (or there are none at all).
+        local_max = ndi.maximum_filter(tmp3, size=3)
+        tmp3_min = np.where(tmp3 == 0, tmp3.max() + 1, tmp3)
+        local_min_nz = ndi.minimum_filter(tmp3_min, size=3)
+        few_unique = (local_max == 0) | (local_max == local_min_nz)
+        tmp1[np.logical_and(tmp1==0, few_unique)] = 1
         #print('tmp1 after logical and', np.unique(tmp1))
         mask_tmp = tmp1
         #print('mask_tmp', np.unique(mask_tmp))
@@ -401,10 +406,23 @@ class Segmenter:
         labels = labels[labels!=0]
         res = pd.DataFrame(np.zeros([len(labels),1]), index=labels, columns=['polygon_perimeter'])
 
-        for label in res.index.values:
-            labelled_cell = self.masks==label
-            vertices = np.array(np.where((skimage.morphology.binary_dilation(labelled_cell, footprint=np.ones([3,3])) * branchpoints) > 0)).T
+        # Build cell→branchpoints map in one pass over branchpoint coordinates,
+        # replacing N separate binary_dilation calls (one per cell) with a single loop.
+        bp_coords = np.argwhere(branchpoints)  # shape (M, 2): row, col
+        cell_to_bp = {label: [] for label in labels}
+        H, W = self.masks.shape
+        for r, c in bp_coords:
+            r0, r1 = max(0, r - 1), min(H, r + 2)
+            c0, c1 = max(0, c - 1), min(W, c + 2)
+            adj = np.unique(self.masks[r0:r1, c0:c1])
+            for lbl in adj[adj != 0]:
+                cell_to_bp[lbl].append((r, c))
 
+        for label in labels:
+            vertices = np.array(cell_to_bp[label])
+            if vertices.shape[0] < 2:
+                res.at[label, 'polygon_perimeter'] = 0
+                continue
             # calculate polygon perimeter
             v_norm = vertices - np.mean(vertices, axis=0)
             theta = np.mod(np.arctan2(v_norm[:,1], v_norm[:,0]), 2*np.pi)
