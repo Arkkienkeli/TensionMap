@@ -1,3 +1,7 @@
+import logging
+import sys
+import time
+
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import generic_filter
@@ -8,9 +12,24 @@ import pandas as pd
 from skimage import measure, color
 from matplotlib import cm, patches, colors
 import matplotlib
+from joblib import Parallel, delayed
 from src.segment import Segmenter
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import warnings
+
+logger = logging.getLogger('tensionmap')
+
+
+def _setup_logger():
+    """Configure the tensionmap logger to write timestamped lines to stdout.
+    Safe to call multiple times — only adds a handler once."""
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter(
+            '[%(asctime)s] %(message)s', datefmt='%H:%M:%S'))
+        logger.addHandler(handler)
+    if logger.level == logging.NOTSET:
+        logger.setLevel(logging.INFO)
 
 
 def sx_grad(p1, p2, q1x, q1y, q2x, q2y, rx, ry):
@@ -183,6 +202,69 @@ def radius_grad(p1,p2,q1x,q1y,q2x,q2y,t1,t2):
                    t14*(t27-t7*(t1-t2+p1*t12))*(-0.5)]).T
     return dR
 
+
+def _fit_edge(i, verts_coords, pixels_i, width, height):
+    """
+    Fit a circular arc to edge i. Standalone (non-method) so it is picklable by joblib.
+
+    Parameters
+    ----------
+    i           : int   — edge index (returned as-is for result ordering)
+    verts_coords: list  — [r1_coords, r2_coords] as lists/arrays of length 2
+    pixels_i    : array — flat pixel indices into (width, height) array
+    width, height: int  — image dimensions
+
+    Returns
+    -------
+    (i, radius, rho, fitenergy)
+    """
+    r1 = np.array(verts_coords[0])
+    r2 = np.array(verts_coords[1])
+
+    # Guard: edges with no pixels (e.g. synthetic edges from remove_fourfold)
+    if len(pixels_i) == 0:
+        return i, np.Inf, np.array([np.Inf, np.Inf]), np.Inf
+
+    edge_pixels = np.array([np.unravel_index(pixel, (width, height)) for pixel in pixels_i])
+
+    nB = np.matmul(np.array([[0, 1], [-1, 0]]), r1 - r2)
+    D = np.sqrt(np.sum(np.power(nB, 2)))
+    nB = np.divide(nB, D)
+    x0 = 0.5 * (r1 + r2)
+
+    delta = np.subtract(edge_pixels, x0)
+    IP = (delta[:, 0] * nB[0]) + (delta[:, 1] * nB[1])
+    L0 = D / 2
+
+    A = 2 * np.sum(np.power(IP, 2))
+    B = np.sum((np.sum(np.power(delta, 2), axis=1) - np.power(L0, 2)) * IP)
+    y0 = np.divide(B, A)
+
+    def energyfunc(x):
+        return np.mean(np.power(
+            np.sqrt(np.sum(np.power(delta - (x * nB), 2), axis=1)) -
+            np.sqrt(np.power(x, 2) + np.power(L0, 2)), 2))
+
+    if not np.isnan(y0):
+        res = minimize(energyfunc, y0, tol=1e-8)
+    else:
+        res = minimize(energyfunc, 0, tol=1e-8)
+    y = res.x
+    E = res.fun
+
+    linedistance = np.mean(np.power(IP, 2))
+    if E < linedistance and len(edge_pixels) > 3:
+        radius = np.sqrt(np.power(y, 2) + np.power(L0, 2))
+        rho = x0 + (y * nB)
+        fitenergy = E
+    else:
+        radius = np.Inf
+        rho = np.array([np.Inf, np.Inf])
+        fitenergy = linedistance
+
+    return i, radius, rho, fitenergy
+
+
 class VMSI():
 
     def __init__(self, vertices, cells, edges, width, height, verbose, optimiser='nlopt'):
@@ -242,47 +324,26 @@ class VMSI():
         Fit circle to each edge
         If edge is too flat, fit line instead
 
+        Parallelized with joblib (prefer='threads') — scipy.optimize.minimize
+        releases the GIL so threads give true parallelism here.
+
         """
-        for i in range(len(self.edges)):
-            r1 = np.array(self.vertices['coords'][self.edges['verts'][i][0]])
-            r2 = np.array(self.vertices['coords'][self.edges['verts'][i][1]])
-
-            edge_pixels = [np.unravel_index(pixel, (self.width, self.height)) for pixel in self.edges['pixels'][i]]
-
-            nB = np.matmul(np.array([[0, 1], [-1, 0]]), r1 - r2)
-            D = np.sqrt(np.sum(np.power(nB, 2)))
-            nB = np.divide(nB, D)
-            x0 = 0.5*(r1 + r2)
-
-            delta = np.subtract(edge_pixels, x0)
-            IP = (delta[:,0] * nB[0]) + (delta[:,1] * nB[1])
-            L0 = D/2
-
-            A = 2*np.sum(np.power(IP, 2))
-            B = np.sum((np.sum(np.power(delta, 2), axis=1) - np.power(L0, 2)) * IP)
-            y0 = np.divide(B, A)
-
-            # Minimise the MSQ between edge pixels and fitted arc
-            def energyfunc(x):
-                return np.mean(np.power(np.sqrt(np.sum(np.power(delta-(x*nB), 2), axis=1)) - np.sqrt(np.power(x, 2) + np.power(L0, 2)), 2))
-
-            if not np.isnan(y0):
-                res = minimize(energyfunc, y0, tol=1e-8)
-            else:
-                res = minimize(energyfunc, 0, tol=1e-8)
-            y = res.x
-            E = res.fun
-
-            linedistance = np.mean(np.power(IP, 2))
-            # Store the radius, centre and fit energy of each fitted circular arc or straight line
-            if (E < linedistance and len(edge_pixels) > 3):
-                self.edges.at[i,'radius'] = np.sqrt(np.power(y, 2) + np.power(L0, 2))
-                self.edges.at[i,'rho'] = x0 + (y * nB)
-                self.edges.at[i,'fitenergy'] = E
-            else:
-                self.edges.at[i,'radius'] = np.Inf
-                self.edges.at[i,'rho'] = np.array([np.Inf, np.Inf])
-                self.edges.at[i,'fitenergy'] = linedistance
+        n_edges = len(self.edges)
+        results = Parallel(n_jobs=-1, prefer='threads')(
+            delayed(_fit_edge)(
+                i,
+                [self.vertices['coords'][self.edges['verts'][i][0]],
+                 self.vertices['coords'][self.edges['verts'][i][1]]],
+                self.edges['pixels'][i],
+                self.width,
+                self.height,
+            )
+            for i in range(n_edges)
+        )
+        for i, radius, rho, fitenergy in results:
+            self.edges.at[i, 'radius'] = radius
+            self.edges.at[i, 'rho'] = rho
+            self.edges.at[i, 'fitenergy'] = fitenergy
         return
 
 
@@ -530,15 +591,24 @@ class VMSI():
         num_edges = 0
         edge_cell_pairs = {frozenset(c) for c in self.edges.cells.to_list() if len(c) == 2}
 
+        # Precompute lookup dict: cell_id -> index in involved_cells
+        # Avoids O(n) np.where scan inside the inner loop (was O(n²) total)
+        cell_to_idx = {cell: idx for idx, cell in enumerate(self.involved_cells)}
+
         for i in range(len(self.involved_cells)):
             cell = self.involved_cells[i]
             for ncell in self.cells.at[cell, 'ncells']:
-                j = np.ravel(np.where(self.involved_cells == ncell))
-                # Ensure that edge between neighbouring cells actually exists
-                if j.size > 0 and adj_mat[i, j] == 0 and frozenset([cell, ncell]) in edge_cell_pairs:
-                    adj_mat[i, j] = 1
-                    adj_mat[j, i] = 1
-                    num_edges += 1
+                j_val = cell_to_idx.get(ncell, None)
+                if j_val is not None:
+                    j = np.array([j_val])
+                    # Ensure that edge between neighbouring cells actually exists
+                    if adj_mat[i, j] == 0 and frozenset([cell, ncell]) in edge_cell_pairs:
+                        adj_mat[i, j] = 1
+                        adj_mat[j, i] = 1
+                        num_edges += 1
+
+        # Precompute lookup dict for involved_vertices as well
+        vert_to_idx = {vert: idx for idx, vert in enumerate(self.involved_vertices)}
 
         # Compute difference operators
         self.dC = np.zeros((num_edges, len(self.involved_cells)))
@@ -558,8 +628,12 @@ class VMSI():
                 verts = np.intersect1d(self.cells['nverts'][self.involved_cells[i]], self.cells['nverts'][self.involved_cells[cell]])
 
                 if (len(verts) == 2):
-                    self.dV[diff_index, np.where(self.involved_vertices == verts[0])] = 1
-                    self.dV[diff_index, np.where(self.involved_vertices == verts[1])] = -1
+                    v0_idx = vert_to_idx.get(verts[0], None)
+                    v1_idx = vert_to_idx.get(verts[1], None)
+                    if v0_idx is not None:
+                        self.dV[diff_index, v0_idx] = 1
+                    if v1_idx is not None:
+                        self.dV[diff_index, v1_idx] = -1
 
                 diff_index += 1
 
@@ -731,7 +805,12 @@ class VMSI():
 
         rho = np.divide(np.matmul(self.dC, np.multiply(q.T,p).T).T, np.matmul(self.dC, p)).T
 
-        for i in range(len(self.involved_edges)):
+        # Vectorize over valid edges (involved_edges >= 0)
+        # Build arrays of vertex coords for all valid-edge rows in one pass
+        valid_mask = self.involved_edges >= 0
+        valid_idx = np.where(valid_mask)[0]
+
+        for i in valid_idx:
             edge = self.involved_edges[i]
             v1 = self.edges.at[edge, 'verts'][0]
             v2 = self.edges.at[edge, 'verts'][1]
@@ -740,7 +819,12 @@ class VMSI():
             r2 = self.vertices['coords'][v2]
 
             r[i] = np.mean(np.power(np.array([np.linalg.norm(r1 - rho[i]), np.linalg.norm(r2 - rho[i])]), 2))
-            r_flat[i] = p[np.where(self.dC[i,:] == 1)] * p[np.where(self.dC[i,:] == -1)] * q_sq[i]
+
+        # Vectorize r_flat computation across all rows
+        # dC[i,:]==1 gives the positive cell index; ==−1 gives the negative
+        pos_idx = np.array([np.where(self.dC[i, :] == 1)[0][0] for i in range(len(self.involved_edges))])
+        neg_idx = np.array([np.where(self.dC[i, :] == -1)[0][0] for i in range(len(self.involved_edges))])
+        r_flat = p[pos_idx] * p[neg_idx] * q_sq
 
         dP = np.matmul(self.dC, p)
         r = np.multiply(r, np.power(dP, 2))
@@ -822,7 +906,8 @@ class VMSI():
                     rows = np.concatenate([self.cell_pairs[:,0],self.cell_pairs[:,0]+self.dC.shape[1],self.cell_pairs[:,0]+2*self.dC.shape[1],
                                            self.cell_pairs[:,1],self.cell_pairs[:,1]+self.dC.shape[1],self.cell_pairs[:,1]+2*self.dC.shape[1]])
 
-                    dE = np.bincount(rows, weights=np.ravel(dE,order='F'))
+                    dE = np.bincount(rows, weights=np.ravel(dE,order='F'),
+                                     minlength=3*self.dC.shape[1])
                     grad[:] = dE
 
                 if np.isfinite(E) and E < _init_best_E[0]:
@@ -866,7 +951,8 @@ class VMSI():
                     rows = np.concatenate([self.cell_pairs[:,0],self.cell_pairs[:,0]+self.dC.shape[1],self.cell_pairs[:,0]+2*self.dC.shape[1],
                                            self.cell_pairs[:,1],self.cell_pairs[:,1]+self.dC.shape[1],self.cell_pairs[:,1]+2*self.dC.shape[1]])
 
-                    grad[:] = np.bincount(rows, weights=np.ravel(dE/self.dC.shape[0],order='F'))
+                    grad[:] = np.bincount(rows, weights=np.ravel(dE/self.dC.shape[0],order='F'),
+                                          minlength=3*self.dC.shape[1])
                 return E
 
             # Define linear constraint for initial optimisation
@@ -940,7 +1026,8 @@ class VMSI():
                     dE = np.divide(-np.multiply(avg_d, dR.T).T,self.dC.shape[0])
                     rows = np.concatenate([self.cell_pairs[:,0], self.cell_pairs[:,1]])
 
-                    grad[:] = np.bincount(rows, weights=np.ravel(dE,order='F'))
+                    grad[:] = np.bincount(rows, weights=np.ravel(dE,order='F'),
+                                          minlength=len(self.involved_cells))
                 if np.isfinite(E) and E < _theta_best_E[0]:
                     _theta_best_E[0] = E
                     _theta_best_x[0] = theta.copy()
@@ -1099,7 +1186,8 @@ class VMSI():
                     dE = np.divide(np.multiply(dNormX, dRhoX.T).T+np.multiply(dNormY, dRhoY.T).T-np.multiply(avg_d, dR.T).T,self.dC.shape[0])
                     rows = np.concatenate([self.cell_pairs[:,0],self.cell_pairs[:,0]+self.dC.shape[1],self.cell_pairs[:,0]+2*self.dC.shape[1],self.cell_pairs[:,0]+3*self.dC.shape[1],
                                            self.cell_pairs[:,1],self.cell_pairs[:,1]+self.dC.shape[1],self.cell_pairs[:,1]+2*self.dC.shape[1],self.cell_pairs[:,1]+3*self.dC.shape[1]])
-                    dE = np.bincount(rows, weights=np.ravel(dE,order='F'))
+                    dE = np.bincount(rows, weights=np.ravel(dE,order='F'),
+                                     minlength=4*self.dC.shape[1])
                     grad[:] = dE.ravel()
 
                 if self.verbose:
@@ -1217,15 +1305,24 @@ class VMSI():
         self.cells.qy[np.sort(self.involved_cells)] = q[np.argsort(self.involved_cells),1]
         self.cells.theta[np.sort(self.involved_cells)] = theta[np.argsort(self.involved_cells),]
 
+        # Precompute lookup dicts to avoid O(n) np.where scans per edge
+        cell_to_idx = {c: i for i, c in enumerate(self.involved_cells)}
+        involved_cells_set = set(self.involved_cells)
+        involved_edges_set = set(self.involved_edges)
+
         for i in range(len(self.edges)):
             edge_cells = self.edges.at[i, 'cells']
 
-            if all(np.isin(edge_cells, self.involved_cells)) and np.isin(i, self.involved_edges):
-                cell_ind1 = np.where(self.involved_cells == edge_cells[0])[0]
-                cell_ind2 = np.where(self.involved_cells == edge_cells[1])[0]
+            if (len(edge_cells) == 2
+                    and edge_cells[0] in involved_cells_set
+                    and edge_cells[1] in involved_cells_set
+                    and i in involved_edges_set):
+                cell_ind1 = cell_to_idx[edge_cells[0]]
+                cell_ind2 = cell_to_idx[edge_cells[1]]
 
-                edge_ind = np.where(np.squeeze((self.dC[:,cell_ind1] != 0) & (self.dC[:,cell_ind2] != 0), axis=1))[0]
-                self.edges.at[i, 'tension'] = T[edge_ind]
+                edge_ind = np.where((self.dC[:, cell_ind1] != 0) & (self.dC[:, cell_ind2] != 0))[0]
+                if edge_ind.size > 0:
+                    self.edges.at[i, 'tension'] = T[edge_ind]
         return
 
     def return_tensions(self):
@@ -1585,36 +1682,48 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
     :return: VMSI object containing the inferred tensions, pressures and stress, as well as cell morphology metrics.
     """
 
+    _setup_logger()
     warnings.filterwarnings('ignore')
 
     # If cells are not labelled, label them
     if not is_labelled:
         img = measure.label(img)
+
+    n_cells = len(np.unique(img)) - 1
+    _t_total = time.time()
+    logger.info(f'TensionMap | image: {img.shape} | cells: {n_cells} | tile: {tile} | optimiser: {optimiser}')
+
     # Test whether there are enough cells to tile image
     if not len(np.unique(img))-1 > 2*cells_per_tile and tile:
-        print('Not enough cells for tiling; proceeding with a single tile.')
+        logger.info('Not enough cells for tiling; proceeding with a single tile.')
         tile = False
     if tile:
 
         # Generating tiling
         tiles, holes_masks, offset, adj_tiles = create_image_tiles(img, holes_mask, cells_per_tile=cells_per_tile, overlap=overlap)
+        n_tiles = len(tiles)
+        logger.info(f'Tiling: {n_tiles} tiles (~{cells_per_tile} cells/tile, {len(adj_tiles)} adjacent pairs)')
         models = []
 
         pairwise_tensions = []
         pairwise_pressures = []
 
         # Iterate through each tile and do stress inference
-        for i in range(len(tiles)):
+        for i in range(n_tiles):
             tile = tiles[i]
             tile_holes_mask = holes_masks[i]
+            _t_tile = time.time()
+            logger.info(f'Tile {i+1}/{n_tiles} | segmenting')
             # process segmented image for input into VMSI
             seg = Segmenter(masks=tile, labelled=is_labelled)
             VMSI_obj, labelled_mask = seg.process_segmented_image(holes_mask=tile_holes_mask)
+            logger.info(f'Tile {i+1}/{n_tiles} | fitting: {len(VMSI_obj.C_df)-1} cells, {len(VMSI_obj.E_df)} edges')
             # create the model
             model = VMSI(vertices=VMSI_obj.V_df, cells=VMSI_obj.C_df, edges=VMSI_obj.E_df, height=tile.shape[0], width=tile.shape[1], verbose=verbose, optimiser=optimiser)
             # fit the model parameters
             model.fit()
             models.append(model)
+            logger.info(f'Tile {i+1}/{n_tiles} | done ({time.time()-_t_tile:.1f}s)')
         # For each pair of adjacent tiles, determine cell overlap and record overlapping tensions and pressures
         for i in range(len(adj_tiles)):
             pair = adj_tiles[i]
@@ -1660,17 +1769,21 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
         res = minimize(t_energy, np.ones(len(tiles)), tol=1e-8, constraints=[constr])
         t_scale = res.x
 
+        logger.info('Merging tiles')
         model = merge_models(models, p_scale, t_scale, offset, img, verbose=verbose, holes_mask=holes_mask)
     else:
         # process segmented image for input into VMSI
+        logger.info('Segmenting')
         seg = Segmenter(masks=img, labelled=is_labelled)
         VMSI_obj, labelled_mask = seg.process_segmented_image(holes_mask=holes_mask)
+        logger.info(f'Fitting: {len(VMSI_obj.C_df)-1} cells, {len(VMSI_obj.E_df)} edges')
         # create the model
         model = VMSI(vertices=VMSI_obj.V_df, cells=VMSI_obj.C_df, edges=VMSI_obj.E_df, height=img.shape[0], width=img.shape[1], verbose=verbose, optimiser=optimiser)
         # fit the model parameters
         model.fit()
         # compute stress tensor
         model.compute_stresstensor()
+    logger.info(f'TensionMap complete | total: {time.time()-_t_total:.1f}s')
     return model
 
 def create_image_tiles(img, holes_mask, cells_per_tile=150, overlap=0.3):

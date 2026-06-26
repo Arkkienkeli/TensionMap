@@ -1,3 +1,6 @@
+import logging
+import time
+
 import matplotlib.pyplot as plt
 import numpy as np
 import skimage.morphology
@@ -12,6 +15,8 @@ import skimage.draw as draw
 from src.bwmorph import *
 import pandas as pd
 from scipy.spatial.distance import cdist
+
+logger = logging.getLogger('tensionmap')
 
 class VMSI_obj:
     def __init__(self):
@@ -42,7 +47,6 @@ class Segmenter:
         """
         Given a segmented mask, produce VMSI_obj for input into VMSI
         """
-
         # Before processing mask, obtain polygon perimeter and original image label for each cell
         polygon_perimeter = self.polygon_perimeter()
         # Process mask
@@ -83,12 +87,10 @@ class Segmenter:
 
         obj.V_df, cc = self.find_vertices(mask_tmp, obj.C_df)
         obj.E_df = self.find_edges(obj, mask_tmp, cc)
-        self.identify_holes(obj,holes_mask)
+        self.identify_holes(obj, holes_mask)
         return obj, mask_tmp
 
     def find_vertices(self, mask, C_df):
-        V_df = pd.DataFrame(columns = ['coords','ncells','nverts','edges'])
-
         branchpoints = self.find_branch_points(mask==0)
 
         cc = measure.label(branchpoints, connectivity=2)
@@ -100,6 +102,8 @@ class Segmenter:
         v = v[v[:,0].argsort()]
 
         R = np.zeros([2,v.shape[0]])
+        # Accumulate vertex rows in a list; do a single pd.DataFrame() call at the end
+        vertex_rows = []
         for i in range(v.shape[0]):
 
             vertex = v[i,:]
@@ -111,11 +115,17 @@ class Segmenter:
             ncells = mask[r0:r1, c0:c1]
             ncells = np.unique(ncells[ncells!=0])-1
 
-            vertex_df = pd.DataFrame({'coords':[vertex],'ncells':[ncells],'nverts':[np.array([])],'edges':[np.array([])]})
-            V_df = pd.concat([V_df, vertex_df], ignore_index=True)
+            vertex_rows.append({'coords': vertex, 'ncells': ncells,
+                                 'nverts': np.array([]), 'edges': np.array([])})
 
             R[0, i] = vertex[0]
             R[1, i] = vertex[1]
+
+        # Single concat — avoids O(n²) DataFrame copies inside the loop
+        if vertex_rows:
+            V_df = pd.DataFrame(vertex_rows)
+        else:
+            V_df = pd.DataFrame(columns=['coords', 'ncells', 'nverts', 'edges'])
         # Identify neighbour vertices
         adj = np.zeros([v.shape[0],v.shape[0]])
 
@@ -163,31 +173,43 @@ class Segmenter:
 
     def find_cells(self, mask):
         # Identify cells, record region information
-        C_df = pd.DataFrame(columns = ['centroids','nverts','numv','ncells','edges', 'area', 'holes',\
-                                       'inertia', 'perimeter','polygon_perimeter','feret_d', \
-                                       'moments_hu','bbox','label'])
-
         # regionprops returns the co-ordinates in numpy indexing rather than cartesian indexing - e.g.
         # (rows, cols) rather than (x, y) so flip
-        c = np.array([np.flip(regionprops.centroid) for regionprops in measure.regionprops(mask)])
-        p = np.array([regionprops.perimeter for regionprops in measure.regionprops(mask)])
-        ine = np.array([regionprops.inertia_tensor[np.triu_indices(2)] for regionprops in measure.regionprops(mask)])
-        bbox = np.array([[regionprops.bbox[3]-regionprops.bbox[1],regionprops.bbox[2]-regionprops.bbox[0]] for regionprops in measure.regionprops(mask)])
-        moments_hu = np.array([regionprops.moments_hu for regionprops in measure.regionprops(mask)])
-        cell_props = pd.DataFrame(measure.regionprops_table(mask, properties=('label', 'feret_diameter_max','area')))
 
-        print(mask.shape, np.unique(mask))
-        print(len(measure.regionprops(mask)), p.shape, c.shape)
+        # Single regionprops call — consolidates the previous 5 separate calls
+        props = measure.regionprops(mask)
+        cell_props = pd.DataFrame(measure.regionprops_table(
+            mask, properties=('label', 'feret_diameter_max', 'area')))
+
+        c = np.array([np.flip(p.centroid) for p in props])
+        peri = np.array([p.perimeter for p in props])
+        ine = np.array([p.inertia_tensor[np.triu_indices(2)] for p in props])
+        bbox = np.array([[p.bbox[3]-p.bbox[1], p.bbox[2]-p.bbox[0]] for p in props])
+        moments_hu = np.array([p.moments_hu for p in props])
+
+        logger.debug('find_cells: mask=%s unique=%s', mask.shape, np.unique(mask))
+        logger.debug('find_cells: %d props, peri.shape=%s, c.shape=%s', len(props), peri.shape, c.shape)
         # estimate very_far to be the half the maximum cell perimeter
-        self.very_far = np.max(p[1:])/2
+        self.very_far = np.max(peri[1:]) / 2
 
-        for i in range(c.shape[0]):
-            cell_df = pd.DataFrame({'centroids':[c[i,:]],'nverts':[np.array([])],'numv':0,'ncells':[np.array([])], 'edges':[np.array([])], \
-                                    'area':cell_props.at[i,'area'], 'holes':False, 'inertia':[ine[i]], \
-                                    'perimeter':p[i], 'polygon_perimeter':0, \
-                                    'feret_d':cell_props.at[i,'feret_diameter_max'], \
-                                    'moments_hu':[moments_hu[i,:]],'bbox':[bbox[i,:]],'label':0})
-            C_df = pd.concat([C_df, cell_df], ignore_index=True)
+        n = c.shape[0]
+        # Build DataFrame in one shot instead of O(n²) pd.concat inside a loop
+        C_df = pd.DataFrame({
+            'centroids': list(c),
+            'nverts': [np.array([]) for _ in range(n)],
+            'numv': np.zeros(n, dtype=int),
+            'ncells': [np.array([]) for _ in range(n)],
+            'edges': [np.array([]) for _ in range(n)],
+            'area': cell_props['area'].values,
+            'holes': [False] * n,
+            'inertia': list(ine),
+            'perimeter': peri,
+            'polygon_perimeter': np.zeros(n),
+            'feret_d': cell_props['feret_diameter_max'].values,
+            'moments_hu': list(moments_hu),
+            'bbox': list(bbox),
+            'label': np.zeros(n, dtype=int),
+        })
         return C_df
 
     def identify_holes(self, obj, holes_mask):
@@ -213,16 +235,11 @@ class Segmenter:
         """
         If cells aren't sequenctially label, relabel them
         """
-        new_mask = np.zeros(mask.shape, dtype=int)
         ids = np.sort(np.unique(mask))
-
-        for i in range(1,len(ids)):
-            new_mask[mask==ids[i]] = i
-        return new_mask
+        # searchsorted maps each mask pixel value to its rank in ids (background 0 stays 0)
+        return np.searchsorted(ids, mask).astype(int)
 
     def find_edges(self, obj, mask, cc):
-        E_df = pd.DataFrame(columns = ['pixels','verts','cells'])
-
         l_dat = mask
         b_dat = (l_dat == 0).astype(int)
 
@@ -245,6 +262,8 @@ class Segmenter:
         end_labels = b_l[re[:,1],re[:,0]]
         b_props = measure.regionprops(b_l)
 
+        # Accumulate edge rows; single pd.DataFrame() call replaces O(n²) pd.concat inside a loop
+        edge_rows = []
         for i in range(1, len(np.unique(b_l))):
             end_points = np.argwhere(end_labels==i)
 
@@ -265,10 +284,14 @@ class Segmenter:
 
             if (v1 != -1) and (v2 != -1) and (v2 in obj.V_df.at[v1, 'nverts']) and ((v1 not in obj.C_df.at[0, 'nverts']) or (v2 not in obj.C_df.at[0, 'nverts'])):
                 pix = np.ravel_multi_index(np.flip(b_props[i-1].coords.T), mask.shape[::-1])
-                verts = np.array([v1, v2])
+                edge_verts = np.array([v1, v2])
                 cells = np.intersect1d(obj.V_df.at[v1, 'ncells'], obj.V_df.at[v2, 'ncells'])
-                edge_df = pd.DataFrame({'pixels':[pix],'verts':[verts],'cells':[cells]})
-                E_df = pd.concat([E_df, edge_df], ignore_index=True)
+                edge_rows.append({'pixels': pix, 'verts': edge_verts, 'cells': cells})
+
+        if edge_rows:
+            E_df = pd.DataFrame(edge_rows)
+        else:
+            E_df = pd.DataFrame(columns=['pixels', 'verts', 'cells'])
 
         # Edit V_df and C_df with edge information
         for v in range(0, len(obj.V_df)):
@@ -284,10 +307,10 @@ class Segmenter:
                     # Create new edge
                     line = draw.line(obj.V_df.at[v, 'coords'][1], obj.V_df.at[v, 'coords'][0], obj.V_df.at[nv, 'coords'][1], obj.V_df.at[nv, 'coords'][0])
                     pix = np.ravel_multi_index(np.flip(line,axis=0), mask.shape[::-1])
-                    verts = np.array([v, nv])
+                    edge_verts = np.array([v, nv])
                     cells = np.intersect1d(obj.V_df.at[v, 'ncells'], obj.V_df.at[nv, 'ncells'])
-                    edge_df = pd.DataFrame({'pixels':[pix],'verts':[verts],'cells':[cells]})
-                    E_df = pd.concat([E_df, edge_df], ignore_index=True)
+                    new_edge = pd.DataFrame({'pixels':[pix],'verts':[edge_verts],'cells':[cells]})
+                    E_df = pd.concat([E_df, new_edge], ignore_index=True)
                     obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], len(E_df) - 1)
                 else:
                     obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], np.array([-1]))
@@ -386,11 +409,9 @@ class Segmenter:
             v_norm = vertices - np.mean(vertices, axis=0)
             theta = np.mod(np.arctan2(v_norm[:,1], v_norm[:,0]), 2*np.pi)
             vertices = vertices[np.argsort(theta),:]
-            perim = 0
-            for i in range(vertices.shape[0]):
-                v1 = vertices[i,:]
-                v2 = vertices[np.mod(i+1, vertices.shape[0]),:]
-                perim += np.linalg.norm(v1-v2)
+            # Vectorized perimeter: roll vertices by 1 and compute all segment lengths at once
+            v_rolled = np.roll(vertices, -1, axis=0)
+            perim = np.sum(np.linalg.norm(vertices - v_rolled, axis=1))
             res.at[label, 'polygon_perimeter'] = perim
         centroids = pd.DataFrame(skimage.measure.regionprops_table(self.masks, properties=['label','centroid']))
         centroids.columns = ['label','centroid_y','centroid_x']
