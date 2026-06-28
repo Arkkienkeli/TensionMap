@@ -1,5 +1,4 @@
 import logging
-import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -7,7 +6,7 @@ import skimage.morphology
 import scipy.ndimage as ndi
 from scipy.ndimage import generic_filter
 from scipy.optimize import minimize, leastsq
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, KDTree
 import skimage.segmentation as seg
 import skimage.morphology as morph
 import skimage.measure as measure
@@ -106,7 +105,6 @@ class Segmenter:
         a = a[v[:,0].argsort()]
         v = v[v[:,0].argsort()]
 
-        R = np.zeros([2,v.shape[0]])
         # Accumulate vertex rows in a list; do a single pd.DataFrame() call at the end
         vertex_rows = []
         for i in range(v.shape[0]):
@@ -123,24 +121,20 @@ class Segmenter:
             vertex_rows.append({'coords': vertex, 'ncells': ncells,
                                  'nverts': np.array([]), 'edges': np.array([])})
 
-            R[0, i] = vertex[0]
-            R[1, i] = vertex[1]
-
         # Single concat — avoids O(n²) DataFrame copies inside the loop
         if vertex_rows:
             V_df = pd.DataFrame(vertex_rows)
         else:
             V_df = pd.DataFrame(columns=['coords', 'ncells', 'nverts', 'edges'])
-        # Identify neighbour vertices
-        adj = np.zeros([v.shape[0],v.shape[0]])
 
-        D = np.add(np.tile(np.sum(np.multiply(R, R), axis=0), (v.shape[0],1)),
-                   np.tile(np.sum(np.multiply(R, R), axis=0), (v.shape[0],1)).T) - 2*np.matmul(R.T, R)
-
+        cell_verts_acc = [[] for _ in range(len(C_df))]
         for V in range(len(V_df)):
             for cell in V_df.at[V, 'ncells']:
                 C_df.at[cell, 'numv'] += 1
-                C_df.at[cell, 'nverts'] = np.append(C_df.at[cell, 'nverts'], np.array([V]))
+                cell_verts_acc[int(cell)].append(V)
+        for cell in range(len(C_df)):
+            if cell_verts_acc[cell]:
+                C_df.at[cell, 'nverts'] = np.array(cell_verts_acc[cell])
 
         for C in range(len(C_df)):
             # If cell has no vertices, assume it must border the external cell only
@@ -150,18 +144,25 @@ class Segmenter:
                 ncells = np.array([0])
             C_df.at[C, 'ncells'] = ncells
 
-        for i in range(v.shape[0]):
-            for j in range(i+1,v.shape[0]):
-                if D[i,j] <= np.power(self.very_far, 2):
-                    v1_ncells = V_df['ncells'].iloc[i]
-                    v1_ncells = v1_ncells[v1_ncells != 0]
-                    v2_ncells = V_df['ncells'].iloc[j]
-                    v2_ncells = v2_ncells[v2_ncells != 0]
+        # Identify neighbour vertices.
+        # Replace the O(n²) double loop (450M iterations at 30K verts) with:
+        #   1. KD-tree spatial query  → candidate pairs within very_far  O(n log n)
+        #   2. Per-pair set intersection → filter to pairs sharing ≥ 2 cells  O(k), k≪n²
+        # Also removes the dense D and adj matrices (each 30K×30K ≈ 7 GB at scale).
+        n_verts = v.shape[0]
+        ncells_sets = [
+            set(V_df.at[vi, 'ncells'][V_df.at[vi, 'ncells'] != 0].tolist())
+            for vi in range(n_verts)
+        ]
+        tree = KDTree(v)  # v is (n_verts, 2)
+        neighbors = [set() for _ in range(n_verts)]
+        for i, j in tree.query_pairs(self.very_far):
+            if len(ncells_sets[i] & ncells_sets[j]) >= 2:
+                neighbors[i].add(j)
+                neighbors[j].add(i)
 
-                    if np.intersect1d(v1_ncells, v2_ncells).size >=2:
-                        adj[i,j] = 1
-                        adj[j,i] = 1
-            V_df['nverts'].iloc[i] = np.where(adj[i,:]==1)[0]
+        for i in range(n_verts):
+            V_df.at[i, 'nverts'] = np.array(sorted(neighbors[i]))
         return V_df, cc
 
     def find_branch_points(self, skel):
@@ -298,27 +299,40 @@ class Segmenter:
         else:
             E_df = pd.DataFrame(columns=['pixels', 'verts', 'cells'])
 
-        # Edit V_df and C_df with edge information
+        # Edit V_df and C_df with edge information.
+        # Build (v1,v2)->edge_index lookup to avoid reconstructing np.vstack(E_df['verts']) per pair
+        # and collect synthetic edge rows for a single pd.concat at the end.
+        edge_lookup = {}
+        for idx, vp in enumerate(E_df['verts'].tolist()):
+            edge_lookup[(int(vp[0]), int(vp[1]))] = idx
+
+        ext0_nverts = set(map(int, obj.C_df.at[0, 'nverts'].tolist()))
+        new_edge_rows = []
+        v_edges_acc = [[] for _ in range(len(obj.V_df))]
+
         for v in range(0, len(obj.V_df)):
             for nv in obj.V_df.at[v, 'nverts']:
-                edge_1 = np.argwhere((np.vstack(E_df['verts'])[:,0] == v)*(np.vstack(E_df['verts'])[:,1] == nv))
-                edge_2 = np.argwhere((np.vstack(E_df['verts'])[:,1] == v)*(np.vstack(E_df['verts'])[:,0] == nv))
-
-                if edge_1.size > 0:
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_1.ravel()[0])
-                elif edge_2.size > 0:
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_2.ravel()[0])
-                elif (v not in obj.C_df.at[0, 'nverts']) and (nv not in obj.C_df.at[0, 'nverts']):
-                    # Create new edge
-                    line = draw.line(obj.V_df.at[v, 'coords'][1], obj.V_df.at[v, 'coords'][0], obj.V_df.at[nv, 'coords'][1], obj.V_df.at[nv, 'coords'][0])
-                    pix = np.ravel_multi_index(np.flip(line,axis=0), mask.shape[::-1])
-                    edge_verts = np.array([v, nv])
+                nv = int(nv)
+                eidx = edge_lookup.get((v, nv), edge_lookup.get((nv, v), None))
+                if eidx is not None:
+                    v_edges_acc[v].append(eidx)
+                elif v not in ext0_nverts and nv not in ext0_nverts:
+                    line = draw.line(obj.V_df.at[v, 'coords'][1], obj.V_df.at[v, 'coords'][0],
+                                     obj.V_df.at[nv, 'coords'][1], obj.V_df.at[nv, 'coords'][0])
+                    pix = np.ravel_multi_index(np.flip(line, axis=0), mask.shape[::-1])
+                    new_idx = len(E_df) + len(new_edge_rows)
                     cells = np.intersect1d(obj.V_df.at[v, 'ncells'], obj.V_df.at[nv, 'ncells'])
-                    new_edge = pd.DataFrame({'pixels':[pix],'verts':[edge_verts],'cells':[cells]})
-                    E_df = pd.concat([E_df, new_edge], ignore_index=True)
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], len(E_df) - 1)
+                    new_edge_rows.append({'pixels': pix, 'verts': np.array([v, nv]), 'cells': cells})
+                    edge_lookup[(v, nv)] = new_idx
+                    edge_lookup[(nv, v)] = new_idx
+                    v_edges_acc[v].append(new_idx)
                 else:
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], np.array([-1]))
+                    v_edges_acc[v].append(-1)
+
+        if new_edge_rows:
+            E_df = pd.concat([E_df, pd.DataFrame(new_edge_rows)], ignore_index=True)
+        for v in range(len(obj.V_df)):
+            obj.V_df.at[v, 'edges'] = np.array(v_edges_acc[v])
 
         for c in range(1, len(obj.C_df)):
             c_verts = obj.C_df.at[c, 'nverts']

@@ -4,6 +4,7 @@ import time
 
 import matplotlib.pyplot as plt
 import numpy as np
+from joblib import Parallel, delayed
 from scipy.ndimage import generic_filter
 from scipy.spatial.distance import cdist
 from scipy.optimize import minimize, least_squares, LinearConstraint
@@ -237,14 +238,14 @@ def _fit_edge(i, verts_coords, pixels_i, width, height):
 
     A = 2 * np.sum(np.power(IP, 2))
     B = np.sum((np.sum(np.power(delta, 2), axis=1) - np.power(L0, 2)) * IP)
-    y0 = np.divide(B, A)
+    y0 = B / A if A > 0 else np.nan
 
     def energyfunc(x):
         return np.mean(np.power(
             np.sqrt(np.sum(np.power(delta - (x * nB), 2), axis=1)) -
             np.sqrt(np.power(x, 2) + np.power(L0, 2)), 2))
 
-    if not np.isnan(y0):
+    if np.isfinite(y0):
         res = minimize(energyfunc, y0, tol=1e-8)
     else:
         res = minimize(energyfunc, 0, tol=1e-8)
@@ -324,8 +325,9 @@ class VMSI():
         If edge is too flat, fit line instead
 
         """
-        for i in range(len(self.edges)):
-            _, radius, rho, fitenergy = _fit_edge(
+        n_edges = len(self.edges)
+        results = Parallel(n_jobs=-1)(
+            delayed(_fit_edge)(
                 i,
                 [self.vertices['coords'][self.edges['verts'][i][0]],
                  self.vertices['coords'][self.edges['verts'][i][1]]],
@@ -333,6 +335,9 @@ class VMSI():
                 self.width,
                 self.height,
             )
+            for i in range(n_edges)
+        )
+        for i, radius, rho, fitenergy in results:
             self.edges.at[i, 'radius'] = radius
             self.edges.at[i, 'rho'] = rho
             self.edges.at[i, 'fitenergy'] = fitenergy
@@ -795,7 +800,9 @@ class VMSI():
         r_flat = np.zeros(len(self.involved_edges))
         q_sq = np.sum(np.power(np.matmul(self.dC, q), 2), axis=1)
 
-        rho = np.divide(np.matmul(self.dC, np.multiply(q.T,p).T).T, np.matmul(self.dC, p)).T
+        dP = np.matmul(self.dC, p)
+        dP_safe = np.where(np.abs(dP) < 1e-9, np.sign(dP + 1e-15) * 1e-9, dP)
+        rho = np.divide(np.matmul(self.dC, np.multiply(q.T, p).T).T, dP_safe).T
 
         # Vectorize over valid edges (involved_edges >= 0)
         # Build arrays of vertex coords for all valid-edge rows in one pass
@@ -818,7 +825,6 @@ class VMSI():
         neg_idx = np.array([np.where(self.dC[i, :] == -1)[0][0] for i in range(len(self.involved_edges))])
         r_flat = p[pos_idx] * p[neg_idx] * q_sq
 
-        dP = np.matmul(self.dC, p)
         r = np.multiply(r, np.power(dP, 2))
 
         A = np.multiply(self.dC.T, dP).T
@@ -1336,17 +1342,17 @@ class VMSI():
         edge_verts = np.array(self.edges.verts.to_list())
 
         i1 = -1*np.ones_like(T)
+        ev_lookup = {tuple(sorted(map(int, edge_verts[k]))): k for k in range(len(edge_verts))}
         for e in range(len(T)):
-            verts = self.involved_vertices[self.dV[e,:] != 0]
-
+            verts = self.involved_vertices[self.dV[e, :] != 0]
             if len(verts) == 2:
-                ind = np.where(np.all(np.sort(verts) == np.sort(edge_verts, axis=1), axis=1))[0]
+                ind_val = ev_lookup.get(tuple(sorted(map(int, verts))), None)
             else:
-                ind = np.array([])
+                ind_val = None
 
-            if ind.size>0 and self.edges.at[int(ind), 'tension'].size>0:
-                T[e] = self.edges.at[int(ind), 'tension']
-                i1[e] = int(ind)
+            if ind_val is not None and np.asarray(self.edges.at[ind_val, 'tension']).size > 0:
+                T[e] = self.edges.at[ind_val, 'tension']
+                i1[e] = ind_val
             else:
                 T[e] = 1
 
@@ -1892,6 +1898,13 @@ def merge_models(models, p_scale, t_scale, offset, img, verbose, holes_mask=None
     # counters for number of inferred values for each edge and cell
     ncell = np.zeros(len(merged_model.cells))
     nedge = np.zeros(len(merged_model.edges))
+    # Precompute merged model edge lookup: sorted cell pair -> edge index.
+    # Avoids O(n_edges * n_merged_edges) np.where scan inside the per-tile loop.
+    merged_edge_lookup = {
+        tuple(sorted(map(int, cells))): idx
+        for idx, cells in enumerate(merged_model.edges.cells.tolist())
+        if len(cells) == 2
+    }
     for i in range(len(models)):
         model = models[i]
         model.cells.pressure = model.cells.pressure.apply(lambda x: x + p_scale[i])
@@ -1910,9 +1923,19 @@ def merge_models(models, p_scale, t_scale, offset, img, verbose, holes_mask=None
         ncell[cell_indices] += 1
 
         for edge in model.involved_edges:
-            index = int(np.where(np.all(np.sort(cell_indices[np.ravel(np.argwhere(np.isin(model.involved_cells, model.edges.at[edge, 'cells'])))]) == np.sort(np.array(merged_model.edges.cells.tolist())), axis=1))[0])
-            merged_model.edges.at[index, 'tension'] = merged_model.edges.at[index, 'tension'] + model.edges.at[edge, 'tension']
-            nedge[index] += 1
+            if edge < 0:
+                continue
+            edge_cells = model.edges.at[edge, 'cells']
+            if len(edge_cells) != 2:
+                continue
+            local_isin = np.ravel(np.argwhere(np.isin(model.involved_cells, edge_cells)))
+            if len(local_isin) < 2:
+                continue
+            key = tuple(sorted(map(int, cell_indices[local_isin])))
+            index = merged_edge_lookup.get(key, None)
+            if index is not None:
+                merged_model.edges.at[index, 'tension'] += model.edges.at[edge, 'tension']
+                nedge[index] += 1
 
     # Take mean over edges and cells with multiple inferred values
     merged_model.cells.loc[ncell>0, 'pressure'] = np.divide(merged_model.cells.loc[ncell>0, 'pressure'].values,ncell[ncell>0])
