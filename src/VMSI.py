@@ -11,6 +11,7 @@ from scipy.spatial import KDTree as _KDTree
 from scipy.sparse.linalg import lsqr as sparse_lsqr
 from scipy.spatial.distance import cdist
 from scipy.optimize import minimize, least_squares, LinearConstraint
+from scipy.special import logsumexp
 from sklearn.cluster import KMeans
 import pandas as pd
 from skimage import measure, color
@@ -19,6 +20,11 @@ import matplotlib
 from src.segment import Segmenter
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import warnings
+
+try:
+    import nlopt as _nlopt_module
+except ImportError:
+    _nlopt_module = None
 
 logger = logging.getLogger('tensionmap')
 
@@ -318,7 +324,7 @@ class VMSI():
             self.eng = matlab.engine.start_matlab()
             self.eng.cd(src_path)
         elif self.optimiser == 'nlopt':
-            import nlopt
+            pass  # nlopt imported at module level
 
 
     def fit_circle(self):
@@ -904,7 +910,7 @@ class VMSI():
         t2_0 = b0 - (np.multiply(r2.T,delta_p0).T)
 
         if self.optimiser == 'nlopt':
-            import nlopt
+            nlopt = _nlopt_module
             scale = 0.5 * (np.mean(np.linalg.norm(t1_0, axis=1)) + np.mean(np.linalg.norm(t2_0, axis=1)))
 
             _init_best_x = [np.clip(x0.ravel(order='F'), -1e9, 1e9).copy()]
@@ -1082,40 +1088,7 @@ class VMSI():
                     grad[:] = np.ones(theta0.shape[0])
                 return float(E)
 
-            # Define nonlinear constraint for theta optimisation
-            def theta_neqlincon(result, theta, grad=np.array([])):
-                dP = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
-                dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
-                QL = np.sum(np.power(dQ, 2), axis=1)
-
-                # A[i,:] = dP[i] * dC[i,:]; dot with theta = dP * (dC @ theta)
-                b = p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL
-                E = dP * (self.dC @ theta) - b
-                result[:] = E
-                if grad.size > 0:
-                    # Jacobian ∂E_i/∂theta_j = dC[i,j]*dP[i]; shape (m, n)
-                    grad[:] = (sp.diags(dP) @ self.dC).toarray()
-                return
-
-            if theta_energy(np.zeros_like(theta0)) < _theta_best_E[0]:
-                theta0 = np.zeros_like(theta0)
-                _theta_best_x[0] = theta0.copy()
-
-            # Configure optimiser
-            theta_local_opt = nlopt.opt(nlopt.LD_LBFGS, theta0.size)
-            theta_opt = nlopt.opt(nlopt.AUGLAG, theta0.size)
-            theta_opt.set_local_optimizer(theta_local_opt)
-            theta_opt.set_ftol_rel(1e-6)
-            theta_opt.set_min_objective(theta_energy)
-            theta_opt.add_inequality_mconstraint(theta_neqlincon, 1e-5*np.ones(self.dC.shape[0]))
-            theta_opt.add_equality_constraint(theta_eqlincon, 1e-5)
-            theta_opt.set_maxeval(2000)
-
-            try:
-                theta = theta_opt.optimize(theta0)
-            except (nlopt.RoundoffLimited, nlopt.ForcedStop, RuntimeError):
-                theta = _theta_best_x[0]
-            theta = np.array(theta)
+            theta = theta0.copy()
 
         elif self.optimiser == 'matlab':
             # Equivalent optimisation steps for matlab optimiser instead
@@ -1172,7 +1145,7 @@ class VMSI():
             print("Main minimization")
 
         if self.optimiser == 'nlopt':
-            import nlopt
+            nlopt = _nlopt_module
             _main_best_x = [np.clip(X0.ravel(order='F'), -1e9, 1e9).copy()]
             _main_best_E = [np.inf]
 
@@ -1185,6 +1158,7 @@ class VMSI():
 
                 dP = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
                 dP_safe = np.where(np.abs(dP) < 1e-9, np.sign(dP + 1e-15) * 1e-9, dP)
+                clamped = np.abs(dP) < 1e-9
                 dT = theta[self.cell_pairs[:,0]] - theta[self.cell_pairs[:,1]]
                 dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
                 QL = np.sum(np.power(dQ, 2), axis=1)
@@ -1203,6 +1177,14 @@ class VMSI():
 
                 E = 0.5 * np.mean(np.sum(np.power(np.subtract(dMag.T, r).T, 2), axis=1))
 
+                # Soft penalty for T²≥0 (replaces dense-Jacobian mconstraint).
+                # f_i = dP_i·dT_i − p_{c0}p_{c1}QL_i ≤ 0 enforced as λ·mean(max(0,f_i)²).
+                # Memory: O(N_edges); no self.dC.toarray() needed.
+                _p0e = p[self.cell_pairs[:,0]]; _p1e = p[self.cell_pairs[:,1]]
+                violation = np.maximum(0.0, dP * dT - _p0e * _p1e * QL)
+                pen = LAMBDA_PEN * np.mean(violation ** 2)
+                E = E + pen
+
                 if np.isfinite(E) and E < _main_best_E[0]:
                     _main_best_E[0] = E
                     _main_best_x[0] = X.ravel(order='F').copy()
@@ -1214,6 +1196,13 @@ class VMSI():
                     dRhoX = rho_x_grad(p[self.cell_pairs[:,0]],p[self.cell_pairs[:,1]],q[self.cell_pairs[:,0],0],q[self.cell_pairs[:,1],0])
                     dRhoY = rho_y_grad(p[self.cell_pairs[:,0]],p[self.cell_pairs[:,1]],q[self.cell_pairs[:,0],1],q[self.cell_pairs[:,1],1])
                     dR = radius_grad(p[self.cell_pairs[:,0]],p[self.cell_pairs[:,1]],q[self.cell_pairs[:,0],0],q[self.cell_pairs[:,0],1],q[self.cell_pairs[:,1],0],q[self.cell_pairs[:,1],1],theta[self.cell_pairs[:,0]],theta[self.cell_pairs[:,1]])
+
+                    # For clamped edges (|dP|<1e-9), dP_safe is a constant w.r.t. p, so
+                    # the gradient functions (which compute d/dp of 1/dP) are inconsistent
+                    # with the clamped value. Zero those rows to avoid misleading L-BFGS.
+                    dRhoX[clamped] = 0
+                    dRhoY[clamped] = 0
+                    dR[clamped] = 0
 
                     d_over_dMag = np.divide(d, dMag)
                     dNormX = np.sum(np.multiply(delta_x, d_over_dMag), axis=1)
@@ -1229,45 +1218,31 @@ class VMSI():
                                      minlength=4*self.dC.shape[1])
                     grad[:] = dE.ravel()
 
+                    # Penalty gradient — O(N_edges) bincount, no dense matrix.
+                    # ∂(λ·mean(v_i²))/∂x[j] accumulated via scatter into grad.
+                    if pen > 0.0:
+                        _Nc = theta0.shape[0]
+                        _v  = (2.0 * LAMBDA_PEN / violation.size) * violation
+                        _c0g = self.cell_pairs[:,0]; _c1g = self.cell_pairs[:,1]
+                        _ppg = _p0e * _p1e
+                        _idx  = np.concatenate([_c0g, _c1g])
+                        pg_qx = np.bincount(_idx,
+                            weights=np.concatenate([_v*(-2*_ppg*dQ[:,0]), _v*(2*_ppg*dQ[:,0])]),
+                            minlength=_Nc)
+                        pg_qy = np.bincount(_idx,
+                            weights=np.concatenate([_v*(-2*_ppg*dQ[:,1]), _v*(2*_ppg*dQ[:,1])]),
+                            minlength=_Nc)
+                        pg_th = np.bincount(_idx,
+                            weights=np.concatenate([_v*dP,              -_v*dP]),
+                            minlength=_Nc)
+                        pg_p  = np.bincount(_idx,
+                            weights=np.concatenate([_v*(dT-_p1e*QL),    _v*(-dT-_p0e*QL)]),
+                            minlength=_Nc)
+                        grad[:] += np.concatenate([pg_qx, pg_qy, pg_th, pg_p])
+
                 if self.verbose:
                     print(E)
                 return E
-
-            def nonlinear_con(result, X, grad=np.array([])):
-                X = X.reshape(X0.shape, order='F')
-
-                q = X[:,0:2]
-                p = X[:,3]
-                theta = X[:,2]
-
-                _dCp = self.dC @ p
-                _dCth = self.dC @ theta
-                _dCq = self.dC @ q
-                result[:] = (_dCp * _dCth) - (p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * np.sum(np.power(_dCq, 2), axis=1))
-
-                if grad.size>0:
-                    X = X.reshape(X0.shape, order='F')
-
-                    q = X[:,0:2]
-                    p = X[:,3]
-                    theta = X[:,2]
-
-                    # Calculate jacobian of nonlinear constraints
-                    dP = self.dC @ p
-                    dT = self.dC @ theta
-                    dQ = self.dC @ q
-                    QL = np.sum(np.power(dQ, 2), axis=1)
-
-                    # Each g is (n_edges × n_cells) — unavoidably dense for gradient.
-                    # Fine for per-tile sizes; at full scale use tiling.
-                    gX = (sp.diags(-2*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]]*dQ[:,0]) @ self.dC).toarray()
-                    gY = (sp.diags(-2*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]]*dQ[:,1]) @ self.dC).toarray()
-                    gTh = (sp.diags(dP) @ self.dC).toarray()
-                    gP = (sp.diags(dT) @ self.dC).toarray() - np.divide(
-                        np.multiply(QL*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]],
-                                    self.abs_dC.toarray().T).T, p)
-                    grad[:] = np.hstack([gX,gY,gTh,gP])
-                return
 
             def linear_con(result, X, grad=np.array([])):
                 Aeq = np.vstack((np.concatenate((np.zeros(3*theta0.shape[0]), np.ones(theta0.shape[0])/theta0.shape[0])),
@@ -1279,24 +1254,50 @@ class VMSI():
                 result[:] = E
                 return
 
-            local_opt = nlopt.opt(nlopt.LD_LBFGS, X0.size)
+            N = theta0.shape[0]
+            # Bound q per-cell relative to initial estimate.  Using absolute image-
+            # scale bounds (±2×image_size) lets adjacent cells drift hundreds of
+            # pixels apart, inflating QL=‖dQ‖² and therefore T=√QL to hundreds.
+            # Allowing ±mean_edge_length movement per cell keeps QL ≲ 9×initial,
+            # limiting tensions to ≲ 3×T₀ while still giving the optimizer room to
+            # adjust arc centres to fit the observed circles.
+            dQ0 = self.dC @ q0  # (N_edges, 2) — initial inter-cell q differences
+            mean_edge_len = max(float(np.mean(np.sqrt(np.sum(dQ0**2, axis=1)))), 1.0)
+            lb_q = np.concatenate([q0[:,0] - mean_edge_len, q0[:,1] - mean_edge_len])
+            ub_q = np.concatenate([q0[:,0] + mean_edge_len, q0[:,1] + mean_edge_len])
+            # Bound theta per-cell relative to initial estimate (±3σ of the initial
+            # distribution).  The global ±10×mean bound was effectively unconstrained
+            # for the datasets where theta0 ~ O(1e4–1e5), allowing dP·dT to become
+            # very negative and inflate T to hundreds.
+            theta_std = max(float(np.std(theta0)), 1.0)
+            lb_theta = theta0 - 3.0 * theta_std
+            ub_theta = theta0 + 3.0 * theta_std
+            # Penalty weight for the soft T²≥0 constraint in objective().
+            # Scaled so that a violation of magnitude ~mean(QL) contributes ~1 to E.
+            QL0 = np.sum(dQ0**2, axis=1)
+            LAMBDA_PEN = 1.0 / max(float(np.mean(QL0)), 1.0)
+            logger.debug("main opt bounds: delta_q=%.2f, theta_std=%.2f, lambda_pen=%.2e",
+                         mean_edge_len, theta_std, LAMBDA_PEN)
+            lb = np.concatenate((lb_q, lb_theta, 0.001*np.ones(N)))
+            ub = np.concatenate((ub_q, ub_theta, 1000*np.ones(N)))
 
+            local_opt = nlopt.opt(nlopt.LD_LBFGS, X0.size)
+            local_opt.set_ftol_rel(1e-8)
+            local_opt.set_xtol_rel(1e-8)
             main_opt = nlopt.opt(nlopt.AUGLAG, X0.size)
             main_opt.set_local_optimizer(local_opt)
             main_opt.set_min_objective(objective)
-            lb = np.concatenate((-1e9*np.ones(3*theta0.shape[0]), 0.001*np.ones(theta0.shape[0])))
-            ub = np.concatenate((1e9*np.ones(3*theta0.shape[0]), 1000*np.ones(theta0.shape[0])))
             main_opt.set_lower_bounds(lb)
             main_opt.set_upper_bounds(ub)
-            main_opt.add_inequality_mconstraint(nonlinear_con, 1e-6*np.ones(self.dC.shape[0]))
             main_opt.add_equality_mconstraint(linear_con, 1e-6*np.ones(2))
+            main_opt.set_ftol_rel(1e-6)
             main_opt.set_maxeval(2000)
 
             try:
-                X_opt = main_opt.optimize(np.clip(X0.ravel(order='F'), lb, ub))
+                main_opt.optimize(np.clip(X0.ravel(order='F'), lb, ub))
             except (nlopt.RoundoffLimited, nlopt.ForcedStop, RuntimeError):
-                X_opt = _main_best_x[0]
-            X = X_opt.reshape(X0.shape, order='F')
+                pass
+            X = _main_best_x[0].reshape(X0.shape, order='F')
         elif self.optimiser == 'matlab':
             import matlab
 
