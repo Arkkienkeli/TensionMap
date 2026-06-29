@@ -6,7 +6,7 @@ import skimage.morphology
 import scipy.ndimage as ndi
 from scipy.ndimage import generic_filter
 from scipy.optimize import minimize, leastsq
-from scipy.spatial import ConvexHull, KDTree
+from scipy.spatial import ConvexHull, KDTree, QhullError
 import skimage.segmentation as seg
 import skimage.morphology as morph
 import skimage.measure as measure
@@ -229,9 +229,13 @@ class Segmenter:
             vcoords_unique_xs = len(set([p[0] for p in vcoords]))
             vcoords_unique_ys = len(set([p[1] for p in vcoords]))
 
-            if vcoords.shape[0] >= 3 and (holes_mask is None or holes_mask[centroid[1], centroid[0]] == 0):
-                hull = ConvexHull(vcoords)
-                if hull.simplices.shape[0] < vcoords.shape[0] and obj.C_df.at[i, 'area'] > 3*np.median(areas):
+            in_mask = holes_mask is None or holes_mask[centroid[1], centroid[0]] == 0
+            if vcoords.shape[0] >= 3 and vcoords_unique_xs >= 2 and vcoords_unique_ys >= 2 and in_mask:
+                try:
+                    hull = ConvexHull(vcoords)
+                    if hull.simplices.shape[0] < vcoords.shape[0] and obj.C_df.at[i, 'area'] > 3*np.median(areas):
+                        obj.C_df.at[i, 'holes'] = True
+                except QhullError:
                     obj.C_df.at[i, 'holes'] = True
             else:
                 obj.C_df.at[i, 'holes'] = True
@@ -250,10 +254,10 @@ class Segmenter:
         b_dat = (l_dat == 0).astype(int)
 
         rv = np.vstack(obj.V_df['coords'])
-        verts = np.zeros(b_dat.shape)
-        verts[rv[:,1],rv[:,0]] = 1
+        verts = np.zeros(b_dat.shape, dtype=bool)  # bool saves ~750 MB vs float64 at full scale
+        verts[rv[:,1],rv[:,0]] = True
 
-        b_dat[np.where(verts == 1)] = 0
+        b_dat[verts] = 0
 #        b_end  = b_dat * morph.dilation(verts, morph.disk(1))
 
         b_dat[cc != 0] = 0
@@ -262,7 +266,18 @@ class Segmenter:
         b_end = self.endpoints(b_dat) * b_dat
 
         re = np.argwhere(b_end.T != 0)
-        D = cdist(re, rv)
+        # Replace full pairwise cdist (N_endpoints × N_verts × 8 B ≈ TB at scale) with
+        # KDTree k=2 nearest-vertex lookup — only the top-2 distances are ever used.
+        if len(re) > 0 and len(rv) > 0:
+            _k = min(2, len(rv))
+            _tree = KDTree(rv)
+            D_nn, D_nn_idx = _tree.query(re, k=_k)
+            if _k == 1:
+                D_nn = D_nn[:, np.newaxis]
+                D_nn_idx = D_nn_idx[:, np.newaxis]
+        else:
+            D_nn = np.empty((0, 2))
+            D_nn_idx = np.empty((0, 2), dtype=int)
 
         b_l = measure.label(b_dat.T, connectivity=1).T
         end_labels = b_l[re[:,1],re[:,0]]
@@ -278,15 +293,16 @@ class Segmenter:
 
             # Edges with 1 endpoint are generally 1-length; ignore these
             if len(end_points) == 2:
-                v1 = np.argmin(D[end_points[0],:])
-                v2 = np.argmin(D[end_points[1],:])
-                if (v1 == v2):
-                    sort1 = np.sort(D[end_points[0],:]).squeeze()
-                    sort2 = np.sort(D[end_points[1],:]).squeeze()
-                    if abs(sort1[0] - sort1[1]) <= np.sqrt(3):
-                        v1 = np.argsort(D[end_points[0],:]).squeeze()[1]
-                    elif abs(sort2[0] - sort2[1]) <= np.sqrt(3):
-                        v2 = np.argsort(D[end_points[1],:]).squeeze()[1]
+                ep0 = int(end_points[0][0])
+                ep1 = int(end_points[1][0])
+                v1 = int(D_nn_idx[ep0, 0])
+                v2 = int(D_nn_idx[ep1, 0])
+                if v1 == v2 and D_nn.shape[1] >= 2:
+                    # KDTree already returns distances sorted ascending — no sort needed
+                    if abs(D_nn[ep0, 0] - D_nn[ep0, 1]) <= np.sqrt(3):
+                        v1 = int(D_nn_idx[ep0, 1])
+                    elif abs(D_nn[ep1, 0] - D_nn[ep1, 1]) <= np.sqrt(3):
+                        v2 = int(D_nn_idx[ep1, 1])
 
             if (v1 != -1) and (v2 != -1) and (v2 in obj.V_df.at[v1, 'nverts']) and ((v1 not in obj.C_df.at[0, 'nverts']) or (v2 not in obj.C_df.at[0, 'nverts'])):
                 pix = np.ravel_multi_index(np.flip(b_props[i-1].coords.T), mask.shape[::-1])

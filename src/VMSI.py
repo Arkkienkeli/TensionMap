@@ -4,8 +4,11 @@ import time
 
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.sparse as sp
 from joblib import Parallel, delayed
 from scipy.ndimage import generic_filter
+from scipy.spatial import KDTree as _KDTree
+from scipy.sparse.linalg import lsqr as sparse_lsqr
 from scipy.spatial.distance import cdist
 from scipy.optimize import minimize, least_squares, LinearConstraint
 from sklearn.cluster import KMeans
@@ -583,66 +586,89 @@ class VMSI():
         Compute difference operators to enable vectorized operations
 
         """
-        # Build cell adjacency matrix
-        adj_mat = np.zeros((len(self.involved_cells), len(self.involved_cells)))
-        num_edges = 0
         edge_cell_pairs = {frozenset(c) for c in self.edges.cells.to_list() if len(c) == 2}
-
-        # Precompute lookup dict: cell_id -> index in involved_cells
-        # Avoids O(n) np.where scan inside the inner loop (was O(n²) total)
         cell_to_idx = {cell: idx for idx, cell in enumerate(self.involved_cells)}
+        vert_to_idx = {vert: idx for idx, vert in enumerate(self.involved_vertices)}
 
+        # Replace dense adj_mat (N_cells² × 8 B — ~300 GB at 193 K cells) with a
+        # seen-pair set plus per-row adjacency lists.
+        seen = set()
+        adj_by_i = [[] for _ in range(len(self.involved_cells))]
         for i in range(len(self.involved_cells)):
             cell = self.involved_cells[i]
             for ncell in self.cells.at[cell, 'ncells']:
-                j_val = cell_to_idx.get(ncell, None)
-                if j_val is not None:
-                    j = np.array([j_val])
-                    # Ensure that edge between neighbouring cells actually exists
-                    if adj_mat[i, j] == 0 and frozenset([cell, ncell]) in edge_cell_pairs:
-                        adj_mat[i, j] = 1
-                        adj_mat[j, i] = 1
-                        num_edges += 1
+                j = cell_to_idx.get(ncell, None)
+                if j is not None and frozenset([cell, ncell]) in edge_cell_pairs:
+                    key = (min(i, j), max(i, j))
+                    if key not in seen:
+                        seen.add(key)
+                        adj_by_i[i].append(j)
+                        adj_by_i[j].append(i)
+        num_edges = len(seen)
 
-        # Precompute lookup dict for involved_vertices as well
-        vert_to_idx = {vert: idx for idx, vert in enumerate(self.involved_vertices)}
-
-        # Compute difference operators
-        self.dC = np.zeros((num_edges, len(self.involved_cells)))
-        self.dV = np.zeros((num_edges, len(self.involved_vertices)))
-        self.cell_pairs = np.zeros((num_edges, 2), dtype=int)
+        # Build dC and dV as sparse COO → CSR (2 nonzeros/row vs dense N_E × N_C).
+        dC_r, dC_c, dC_d = [], [], []
+        dV_r, dV_c, dV_d = [], [], []
+        cell_pair_list = []
+        vert_pair_list = []  # (v0_idx, v1_idx) per edge; -1 when absent
 
         diff_index = 0
         for i in range(len(self.involved_cells)):
-            ncells = np.ravel(np.where(adj_mat[i,:] == 1))
-            ncells = ncells[ncells > i]
+            for j in sorted(adj_by_i[i]):
+                if j <= i:
+                    continue
+                dC_r += [diff_index, diff_index]
+                dC_c += [i, j]
+                dC_d += [1, -1]
+                cell_pair_list.append([i, j])
 
-            for cell in ncells:
-                self.dC[diff_index, i] = 1
-                self.dC[diff_index, cell] = -1
-                self.cell_pairs[diff_index] = np.array([i, cell])
-
-                verts = np.intersect1d(self.cells['nverts'][self.involved_cells[i]], self.cells['nverts'][self.involved_cells[cell]])
-
-                if (len(verts) == 2):
-                    v0_idx = vert_to_idx.get(verts[0], None)
-                    v1_idx = vert_to_idx.get(verts[1], None)
-                    if v0_idx is not None:
-                        self.dV[diff_index, v0_idx] = 1
-                    if v1_idx is not None:
-                        self.dV[diff_index, v1_idx] = -1
+                verts = np.intersect1d(
+                    self.cells['nverts'][self.involved_cells[i]],
+                    self.cells['nverts'][self.involved_cells[j]])
+                if len(verts) == 2:
+                    v0 = vert_to_idx.get(int(verts[0]), None)
+                    v1 = vert_to_idx.get(int(verts[1]), None)
+                    if v0 is not None:
+                        dV_r.append(diff_index); dV_c.append(v0); dV_d.append(1)
+                    if v1 is not None:
+                        dV_r.append(diff_index); dV_c.append(v1); dV_d.append(-1)
+                    vert_pair_list.append([v0 if v0 is not None else -1,
+                                            v1 if v1 is not None else -1])
+                else:
+                    vert_pair_list.append([-1, -1])
 
                 diff_index += 1
 
-        # Check for bad vertices and edges
-        bad_verts = np.invert(np.sum(np.abs(self.dV), axis=0) == 0)
-        self.dV = self.dV[:,bad_verts]
-        self.involved_vertices = self.involved_vertices[bad_verts]
+        n_ic = len(self.involved_cells)
+        n_iv = len(self.involved_vertices)
+        self.dC = sp.csr_matrix((dC_d, (dC_r, dC_c)), shape=(num_edges, n_ic))
+        self.dV = sp.csr_matrix((dV_d, (dV_r, dV_c)), shape=(num_edges, n_iv))
+        self.cell_pairs = np.array(cell_pair_list, dtype=int)
+        vert_pairs = np.array(vert_pair_list, dtype=int)
 
-        bad_edges = np.invert(np.sum(np.abs(self.dV), axis=1) < 2)
-        self.dV = self.dV[bad_edges,:]
-        self.dC = self.dC[bad_edges,:]
-        self.cell_pairs = self.cell_pairs[bad_edges,:]
+        # Filter vertices not referenced by any edge row.
+        dV_abs = self.dV.copy(); dV_abs.data = np.abs(dV_abs.data)
+        keep_verts = np.asarray(dV_abs.sum(axis=0)).ravel() != 0
+        self.dV = self.dV[:, keep_verts]
+        old_to_new_v = np.full(n_iv, -1, dtype=int)
+        old_to_new_v[keep_verts] = np.arange(keep_verts.sum())
+        vert_pairs = np.where(
+            vert_pairs >= 0,
+            old_to_new_v[np.clip(vert_pairs, 0, n_iv - 1)],
+            -1)
+        self.involved_vertices = self.involved_vertices[keep_verts]
+
+        # Filter edge rows with fewer than 2 vertex assignments.
+        dV_abs2 = self.dV.copy(); dV_abs2.data = np.abs(dV_abs2.data)
+        keep_edges = np.asarray(dV_abs2.sum(axis=1)).ravel() >= 2
+        self.dV = self.dV[keep_edges, :]
+        self.dC = self.dC[keep_edges, :]
+        self.cell_pairs = self.cell_pairs[keep_edges]
+        self.vert_pairs = vert_pairs[keep_edges]  # (num_good_edges, 2)
+
+        # Precompute |dC| for use in compute_stresstensor (abs of ±1 sparse matrix).
+        self.abs_dC = self.dC.copy()
+        self.abs_dC.data = np.ones_like(self.abs_dC.data)
         return
 
 
@@ -657,11 +683,19 @@ class VMSI():
 
         self.involved_edges = -1 * np.ones(self.dC.shape[0], dtype=int)
 
+        # With sparse dC, use cell_pairs instead of per-column sparse access.
         for i in range(len(self.edges)):
             edge_cells = self.edges.at[i, 'cells']
             if len(edge_cells) != 2:
                 continue
-            idx = np.where((self.dC[:,np.where(edge_cells[0]==self.involved_cells)[0]] != 0) & (self.dC[:,np.where(edge_cells[1]==self.involved_cells)[0]] != 0))[0]
+            c0 = np.where(edge_cells[0] == self.involved_cells)[0]
+            c1 = np.where(edge_cells[1] == self.involved_cells)[0]
+            if len(c0) == 0 or len(c1) == 0:
+                continue
+            c0, c1 = int(c0[0]), int(c1[0])
+            idx = np.where(
+                ((self.cell_pairs[:, 0] == c0) & (self.cell_pairs[:, 1] == c1)) |
+                ((self.cell_pairs[:, 0] == c1) & (self.cell_pairs[:, 1] == c0)))[0]
             self.involved_edges[idx] = i
 
         # initialise variables
@@ -670,19 +704,14 @@ class VMSI():
 
         v_coords = np.concatenate([self.vertices['coords'][self.involved_vertices].tolist()])
 
-        e_chord = np.matmul(self.dV, v_coords)
+        e_chord = self.dV @ v_coords  # sparse @ dense → dense
 
-        e_cells = np.zeros((self.dV.shape[0], 2), dtype=int)
-        r1 = np.zeros((self.dV.shape[0], 2))
-        r2 = np.zeros((self.dV.shape[0], 2))
+        # Use precomputed vert_pairs / cell_pairs instead of per-row sparse indexing.
+        r1 = v_coords[self.vert_pairs[:, 0], :]
+        r2 = v_coords[self.vert_pairs[:, 1], :]
+        e_cells = self.cell_pairs.copy()
 
         for e in range(self.dV.shape[0]):
-
-            e_verts = np.ravel([np.where(self.dV[e,:] == 1), np.where(self.dV[e,:] == -1)])
-            e_cells[e,:] = np.ravel([np.where(self.dC[e,:] == 1), np.where(self.dC[e,:] == -1)])
-
-            r1[e,:] = v_coords[e_verts[0],:]
-            r2[e,:] = v_coords[e_verts[1],:]
 
             # If edge is curved, rotate t by pi/2 to get tau
             # t is a vector between the centre of curvature and vertex
@@ -720,26 +749,31 @@ class VMSI():
 
         """
 
-        L1 = np.zeros((e_cells.shape[0], q.shape[0]))
-        L2 = np.zeros((e_cells.shape[0], q.shape[0]))
-
-        for i in range(e_cells.shape[0]):
-            L1[i, e_cells[i,0]] = np.dot(q[e_cells[i,0],:] - r1[i], tau_1[i])
-            L1[i, e_cells[i,1]] = -np.dot(q[e_cells[i,1],:] - r1[i], tau_1[i])
-            L2[i, e_cells[i,0]] = np.dot(q[e_cells[i,0],:] - r2[i], tau_2[i])
-            L2[i, e_cells[i,1]] = -np.dot(q[e_cells[i,1],:] - r2[i], tau_2[i])
+        # Build L1/L2 as sparse COO → CSR (2 nonzeros/row vs dense N_E × N_C).
+        m, n = e_cells.shape[0], q.shape[0]
+        c0, c1 = e_cells[:, 0], e_cells[:, 1]
+        idx = np.arange(m)
+        v1_0 = np.einsum('ij,ij->i', q[c0] - r1, tau_1)
+        v1_1 = np.einsum('ij,ij->i', q[c1] - r1, tau_1)
+        v2_0 = np.einsum('ij,ij->i', q[c0] - r2, tau_2)
+        v2_1 = np.einsum('ij,ij->i', q[c1] - r2, tau_2)
+        L1 = sp.csr_matrix((np.concatenate([v1_0, -v1_1]),
+                             (np.concatenate([idx, idx]), np.concatenate([c0, c1]))),
+                            shape=(m, n))
+        L2 = sp.csr_matrix((np.concatenate([v2_0, -v2_1]),
+                             (np.concatenate([idx, idx]), np.concatenate([c0, c1]))),
+                            shape=(m, n))
 
         scale = np.mean(np.linalg.norm(q, axis=1))
-        b = np.zeros(2*L1.shape[0] + 1)
+        b = np.zeros(2 * m + 1)
         b[-1] = scale
 
         # Initial estimates generated by minimising sum of
         # p_a((q_a-r_i) * tau_i) = p_b((q_b-r_i) * tau_i) for cells a and b at vertex i
         # Overall scale maintained such that mean pressure = 1
-
-        L = np.vstack((L1, L2, np.array(np.divide(np.ones(q.shape[0]), q.shape[0]))))
-
-        p = np.linalg.lstsq(L,b)[0]
+        mean_row = sp.csr_matrix(np.ones((1, n)) / n)
+        L = sp.vstack([L1, L2, mean_row])
+        p = sparse_lsqr(L, b)[0]
         p = np.divide(p, np.mean(p))
         return p
 
@@ -798,11 +832,14 @@ class VMSI():
 
         r = np.zeros(len(self.involved_edges))
         r_flat = np.zeros(len(self.involved_edges))
-        q_sq = np.sum(np.power(np.matmul(self.dC, q), 2), axis=1)
+        q_sq = np.sum(np.power(self.dC @ q, 2), axis=1)
 
-        dP = np.matmul(self.dC, p)
-        dP_safe = np.where(np.abs(dP) < 1e-9, np.sign(dP + 1e-15) * 1e-9, dP)
-        rho = np.divide(np.matmul(self.dC, np.multiply(q.T, p).T).T, dP_safe).T
+        dP = self.dC @ p
+        # N[i] = dC[i,:] @ (p * q), the numerator of rho.  Instead of computing
+        # rho = N/dP and then r[i] = ||r1 - rho[i]||² * dP[i]², we factor the
+        # dP² directly into the distance: ||r1·dP[i] - N[i]||².  This is exact
+        # for all dP (including 0) and avoids large intermediates when dP≈0.
+        N = self.dC @ (p[:, np.newaxis] * q)  # shape (n_edges, 2)
 
         # Vectorize over valid edges (involved_edges >= 0)
         # Build arrays of vertex coords for all valid-edge rows in one pass
@@ -814,23 +851,27 @@ class VMSI():
             v1 = self.edges.at[edge, 'verts'][0]
             v2 = self.edges.at[edge, 'verts'][1]
 
-            r1 = self.vertices['coords'][v1]
-            r2 = self.vertices['coords'][v2]
+            r1 = np.asarray(self.vertices['coords'][v1], dtype=float)
+            r2 = np.asarray(self.vertices['coords'][v2], dtype=float)
 
-            r[i] = np.mean(np.power(np.array([np.linalg.norm(r1 - rho[i]), np.linalg.norm(r2 - rho[i])]), 2))
+            d1 = r1 * dP[i] - N[i]
+            d2 = r2 * dP[i] - N[i]
+            r[i] = np.mean([np.dot(d1, d1), np.dot(d2, d2)])
 
-        # Vectorize r_flat computation across all rows
-        # dC[i,:]==1 gives the positive cell index; ==−1 gives the negative
-        pos_idx = np.array([np.where(self.dC[i, :] == 1)[0][0] for i in range(len(self.involved_edges))])
-        neg_idx = np.array([np.where(self.dC[i, :] == -1)[0][0] for i in range(len(self.involved_edges))])
+        # Use precomputed cell_pairs — avoids per-row sparse indexing.
+        pos_idx = self.cell_pairs[:, 0]
+        neg_idx = self.cell_pairs[:, 1]
         r_flat = p[pos_idx] * p[neg_idx] * q_sq
 
-        r = np.multiply(r, np.power(dP, 2))
+        # r[i] already incorporates dP[i]² via the stable formulation above
 
-        A = np.multiply(self.dC.T, dP).T
+        # A = dC scaled row-wise by dP; shape (n_edges, n_cells). Dense allocation
+        # at scale is O(N_E × N_C) — use sparse diag scaling + sparse_lsqr instead.
+        A = sp.diags(dP) @ self.dC   # sparse (N_E, N_C)
         b = r_flat - r
-
-        theta = np.linalg.lstsq(np.vstack((A, np.ones(A.shape[1]))),np.concatenate((b, np.array([0]))))[0]
+        ones_row = sp.csr_matrix(np.ones((1, self.dC.shape[1])))
+        theta = sparse_lsqr(sp.vstack([A, ones_row]),
+                            np.concatenate([b, [0.0]]))[0]
 
         return theta
 
@@ -855,8 +896,8 @@ class VMSI():
         q0 = x0[:,0:2]
         p0 = x0[:,2]
 
-        b0 = np.matmul(self.dC, np.multiply(q0.T,p0).T)
-        delta_p0 = np.matmul(self.dC, p0)
+        b0 = self.dC @ (p0[:, np.newaxis] * q0)
+        delta_p0 = self.dC @ p0
 
         # Get initial values for t_i and t_j
         t1_0 = b0 - (np.multiply(r1.T,delta_p0).T)
@@ -875,8 +916,8 @@ class VMSI():
                 q = x[:,0:2]
                 p = x[:,2]
 
-                b = np.matmul(self.dC, np.multiply(q.T,p).T)
-                delta_p = np.matmul(self.dC, p)
+                b = self.dC @ (p[:, np.newaxis] * q)
+                delta_p = self.dC @ p
 
                 v1 = b - np.multiply(r1.T, delta_p).T
                 v2 = b - np.multiply(r2.T, delta_p).T
@@ -921,8 +962,8 @@ class VMSI():
                 q = x[:,0:2]
                 p = x[:,2]
 
-                b = np.matmul(self.dC, np.multiply(q.T,p).T)
-                delta_p = np.matmul(self.dC, p)
+                b = self.dC @ (p[:, np.newaxis] * q)
+                delta_p = self.dC @ p
 
                 v1 = b - np.multiply(r1.T, delta_p).T
                 v2 = b - np.multiply(r2.T, delta_p).T
@@ -1000,7 +1041,7 @@ class VMSI():
                 dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
                 QL = np.sum(np.power(dQ, 2), axis=1)
 
-                rho = np.divide(np.matmul(self.dC,np.multiply(p, q.T).T).T, dP_safe).T
+                rho = np.divide((self.dC @ (p[:, np.newaxis] * q)).T, dP_safe).T
                 r_sq = np.divide(((p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL) - (dP * dT)), np.power(dP_safe, 2))
                 ind_z = r_sq<0
                 r_sq[r_sq<0] = 0
@@ -1047,13 +1088,13 @@ class VMSI():
                 dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
                 QL = np.sum(np.power(dQ, 2), axis=1)
 
-                A = np.multiply(dP, self.dC.T).T
+                # A[i,:] = dP[i] * dC[i,:]; dot with theta = dP * (dC @ theta)
                 b = p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL
-
-                E = np.dot(A, theta) - b
+                E = dP * (self.dC @ theta) - b
                 result[:] = E
                 if grad.size > 0:
-                    grad[:] = np.multiply(self.dC.T, dP).T
+                    # Jacobian ∂E_i/∂theta_j = dC[i,j]*dP[i]; shape (m, n)
+                    grad[:] = (sp.diags(dP) @ self.dC).toarray()
                 return
 
             if theta_energy(np.zeros_like(theta0)) < _theta_best_E[0]:
@@ -1148,7 +1189,7 @@ class VMSI():
                 dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
                 QL = np.sum(np.power(dQ, 2), axis=1)
 
-                rho = np.divide(np.matmul(self.dC,np.multiply(p, q.T).T).T, dP_safe).T
+                rho = np.divide((self.dC @ (p[:, np.newaxis] * q)).T, dP_safe).T
                 r_sq = np.divide(((p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL) - (dP * dT)), np.power(dP_safe, 2))
                 ind_z = r_sq<=0
                 r_sq[ind_z] = 0
@@ -1199,7 +1240,10 @@ class VMSI():
                 p = X[:,3]
                 theta = X[:,2]
 
-                result[:] = (np.matmul(self.dC,p) * np.matmul(self.dC, theta)) - (p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * np.sum(np.power(np.matmul(self.dC, q), 2), axis=1))
+                _dCp = self.dC @ p
+                _dCth = self.dC @ theta
+                _dCq = self.dC @ q
+                result[:] = (_dCp * _dCth) - (p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * np.sum(np.power(_dCq, 2), axis=1))
 
                 if grad.size>0:
                     X = X.reshape(X0.shape, order='F')
@@ -1209,15 +1253,19 @@ class VMSI():
                     theta = X[:,2]
 
                     # Calculate jacobian of nonlinear constraints
-                    dP = np.matmul(self.dC,p)
-                    dT = np.matmul(self.dC, theta)
-                    dQ = np.matmul(self.dC, q)
+                    dP = self.dC @ p
+                    dT = self.dC @ theta
+                    dQ = self.dC @ q
                     QL = np.sum(np.power(dQ, 2), axis=1)
 
-                    gX = np.multiply(self.dC.T, -2*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]]*dQ[:,0]).T
-                    gY = np.multiply(self.dC.T, -2*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]]*dQ[:,1]).T
-                    gTh = np.multiply(self.dC.T, dP).T
-                    gP = np.multiply(self.dC.T, dT).T - np.divide(np.multiply(QL*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]],np.abs(self.dC).T).T,p)
+                    # Each g is (n_edges × n_cells) — unavoidably dense for gradient.
+                    # Fine for per-tile sizes; at full scale use tiling.
+                    gX = (sp.diags(-2*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]]*dQ[:,0]) @ self.dC).toarray()
+                    gY = (sp.diags(-2*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]]*dQ[:,1]) @ self.dC).toarray()
+                    gTh = (sp.diags(dP) @ self.dC).toarray()
+                    gP = (sp.diags(dT) @ self.dC).toarray() - np.divide(
+                        np.multiply(QL*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]],
+                                    self.abs_dC.toarray().T).T, p)
                     grad[:] = np.hstack([gX,gY,gTh,gP])
                 return
 
@@ -1282,10 +1330,10 @@ class VMSI():
         applies the Young-Laplace law to obtain the tensions at every edge
 
         """
-        T = np.matmul(self.dC, q)
+        T = self.dC @ q
         T = np.sum(np.power(T, 2), axis=1)
-        T = T * np.abs(np.array([p[alpha] * p[beta] for (alpha,beta) in self.cell_pairs]))
-        T = T - np.multiply(np.matmul(self.dC, p), np.matmul(self.dC, theta))
+        T = T * np.abs(p[self.cell_pairs[:, 0]] * p[self.cell_pairs[:, 1]])
+        T = T - (self.dC @ p) * (self.dC @ theta)
         if np.any(T < 0):
             warnings.warn(f"{np.sum(T < 0)} edge(s) have negative T^2 before sqrt — constraint violations at optimizer exit; clamping to 0.")
         T = np.sqrt(np.maximum(T, 0.0))
@@ -1318,7 +1366,9 @@ class VMSI():
                 cell_ind1 = cell_to_idx[edge_cells[0]]
                 cell_ind2 = cell_to_idx[edge_cells[1]]
 
-                edge_ind = np.where((self.dC[:, cell_ind1] != 0) & (self.dC[:, cell_ind2] != 0))[0]
+                edge_ind = np.where(
+                    ((self.cell_pairs[:, 0] == cell_ind1) & (self.cell_pairs[:, 1] == cell_ind2)) |
+                    ((self.cell_pairs[:, 0] == cell_ind2) & (self.cell_pairs[:, 1] == cell_ind1)))[0]
                 if edge_ind.size > 0:
                     self.edges.at[i, 'tension'] = T[edge_ind]
         return
@@ -1344,8 +1394,10 @@ class VMSI():
         i1 = -1*np.ones_like(T)
         ev_lookup = {tuple(sorted(map(int, edge_verts[k]))): k for k in range(len(edge_verts))}
         for e in range(len(T)):
-            verts = self.involved_vertices[self.dV[e, :] != 0]
-            if len(verts) == 2:
+            # Use vert_pairs instead of per-row sparse access dV[e, :] != 0.
+            vp = self.vert_pairs[e]
+            if vp[0] >= 0 and vp[1] >= 0:
+                verts = self.involved_vertices[vp]
                 ind_val = ev_lookup.get(tuple(sorted(map(int, verts))), None)
             else:
                 ind_val = None
@@ -1358,14 +1410,13 @@ class VMSI():
 
         rv = np.array([self.vertices.at[vertex, 'coords'] for vertex in self.involved_vertices])
 
-
-        rb = np.matmul(self.dV, rv)
+        rb = self.dV @ rv   # sparse @ dense → dense
         D = np.sqrt(np.sum(np.power(rb, 2), 1))
         D[D==0] = 1
         rb = np.divide(rb.T, D).T
         Rot = np.array([[0,-1],[1,0]])
-        nb = np.matmul(rb, Rot.T)
-        dP = np.matmul(self.dC, p)
+        nb = rb @ Rot.T
+        dP = self.dC @ p
 
         sigmaB = np.zeros([rb.shape[0], 3])
         sigmaB[:,0] = rb[:,0] * T * rb[:,0]
@@ -1377,7 +1428,8 @@ class VMSI():
         sigmaP[:,1] = nb[:,0] * dP * D * nb[:,1]
         sigmaP[:,2] = nb[:,1] * dP * D * nb[:,1]
 
-        sigma = np.matmul(np.abs(self.dC.T), sigmaB) + 0.5 * np.matmul(self.dC.T, sigmaP)
+        # abs_dC precomputed in build_diff_operators (entries set to 1).
+        sigma = self.abs_dC.T @ sigmaB + 0.5 * (self.dC.T @ sigmaP)
 
         A = np.array(self.cells.area.to_list())[self.involved_cells]
         sigma = np.divide(sigma.T, A)
@@ -1573,13 +1625,19 @@ class VMSI():
         A = np.array(self.cells.area.to_list()[1:])
         r0 = 0.5 * np.mean(np.sqrt(np.divide(A, np.pi)))
 
-        dist = cdist(rc, rc)
-        smk = np.exp(-np.power(dist, 2)/(2*np.power(smoothsize*r0,2)))
-        smk = np.divide(smk, np.sum(smk, axis=1))
-
-        stress[:,0] = smk @ stress[:,0]
-        stress[:,1] = smk @ stress[:,1]
-        stress[:,2] = smk @ stress[:,2]
+        # Full cdist(rc, rc) is O(N²) — ~300 GB at 193 K cells.
+        # Process in row-chunks so peak extra RAM = chunk_size × N × 8 B.
+        n = len(rc)
+        sigma_sq = 2.0 * (smoothsize * r0) ** 2
+        chunk = max(1, min(500, n))
+        stress_out = np.zeros_like(stress)
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            d2 = np.sum((rc[start:end, np.newaxis, :] - rc[np.newaxis, :, :]) ** 2, axis=2)
+            w = np.exp(-d2 / sigma_sq)             # (chunk, n)
+            w /= w.sum(axis=1, keepdims=True)
+            stress_out[start:end] = w @ stress     # (chunk, 3)
+        stress = stress_out
 
         for i in range(len(self.involved_cells)):
             cell = self.involved_cells[i]
