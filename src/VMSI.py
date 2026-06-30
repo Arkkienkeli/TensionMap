@@ -724,8 +724,19 @@ class VMSI():
             if self.involved_edges[e] >= 0 and self.edges.at[self.involved_edges[e], 'radius'] < np.inf:
                 rho = self.edges.at[self.involved_edges[e], 'rho']
 
-                t1 = np.divide(r1[e,:] - rho, np.linalg.norm(r1[e,:] - rho))
-                t2 = np.divide(r2[e,:] - rho, np.linalg.norm(r2[e,:] - rho))
+                n1 = np.linalg.norm(r1[e,:] - rho)
+                n2 = np.linalg.norm(r2[e,:] - rho)
+                if n1 < 1e-10 or n2 < 1e-10 or not np.isfinite(n1) or not np.isfinite(n2):
+                    # Degenerate arc (vertex at/near centre, or Inf rho): treat as straight
+                    chord_norm = np.linalg.norm(e_chord[e,:])
+                    if chord_norm > 1e-10:
+                        tau_1[e,:] = -e_chord[e,:] / chord_norm
+                        tau_2[e,:] = e_chord[e,:] / chord_norm
+                    # else: zero-length edge — leave tau as zeros
+                    continue
+
+                t1 = (r1[e,:] - rho) / n1
+                t2 = (r2[e,:] - rho) / n2
 
                 if np.linalg.det(np.array((t1,t2))) > 0:
                     tau_1[e,:] = np.matmul(np.array([[0,-1],[1,0]]), t1)
@@ -735,8 +746,11 @@ class VMSI():
                     tau_2[e,:] = -np.matmul(np.array([[0,-1],[1,0]]), t2)
             # If edge is straight, simply take the edge vector to get tau
             else:
-                tau_1[e,:] = -np.divide(e_chord[e,:], np.linalg.norm(e_chord[e,:]))
-                tau_2[e,:] = np.divide(e_chord[e,:], np.linalg.norm(e_chord[e,:]))
+                chord_norm = np.linalg.norm(e_chord[e,:])
+                if chord_norm > 1e-10:
+                    tau_1[e,:] = -e_chord[e,:] / chord_norm
+                    tau_2[e,:] = e_chord[e,:] / chord_norm
+                # else: zero-length edge — leave tau as zeros
         return e_cells, tau_1, tau_2, r1, r2
 
 
@@ -1135,6 +1149,11 @@ class VMSI():
             print("Initial minimization")
         # Perform initial minimization for p, q and theta
         q0, p0, theta0 = self.initial_minimization()
+        # Guard against NaN from degenerate edges (e.g. zero-length chord in estimate_tau)
+        if not np.all(np.isfinite(theta0)):
+            n_bad = int(np.sum(~np.isfinite(theta0)))
+            logger.warning("initial_minimization: %d non-finite theta values — replacing with 0", n_bad)
+            theta0 = np.where(np.isfinite(theta0), theta0, 0.0)
         X0 = np.vstack([q0.T, theta0.squeeze(), p0.squeeze()]).T
 
         q0 = X0[:,0:2]
@@ -1269,9 +1288,10 @@ class VMSI():
             # distribution).  The global ±10×mean bound was effectively unconstrained
             # for the datasets where theta0 ~ O(1e4–1e5), allowing dP·dT to become
             # very negative and inflate T to hundreds.
-            theta_std = max(float(np.std(theta0)), 1.0)
-            lb_theta = theta0 - 3.0 * theta_std
-            ub_theta = theta0 + 3.0 * theta_std
+            theta_std = max(float(np.nanstd(theta0)), 1.0)
+            theta0_safe = np.where(np.isfinite(theta0), theta0, 0.0)
+            lb_theta = theta0_safe - 3.0 * theta_std
+            ub_theta = theta0_safe + 3.0 * theta_std
             # Penalty weight for the soft T²≥0 constraint in objective().
             # Scaled so that a violation of magnitude ~mean(QL) contributes ~1 to E.
             QL0 = np.sum(dQ0**2, axis=1)
